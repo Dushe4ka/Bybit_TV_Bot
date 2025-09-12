@@ -2,8 +2,8 @@ from celery.schedules import crontab
 import platform
 
 # Настройки брокера и бэкенда
-broker_url = 'redis://localhost:6379/0'
-result_backend = 'redis://localhost:6379/0'
+broker_url = 'redis://:Ollama12357985@127.0.0.1:14572/0'
+result_backend = 'redis://:Ollama12357985@127.0.0.1:14572/0'
 
 # Настройки задач
 task_serializer = 'json'
