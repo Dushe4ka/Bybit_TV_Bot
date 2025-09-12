@@ -1,0 +1,5 @@
+aiogram
+celery
+requests
+fastapi
+bybit

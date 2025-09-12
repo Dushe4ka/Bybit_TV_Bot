@@ -1,0 +1,4 @@
+server:
+    python -m main
+celery:
+    celery -A celery_app.tasks.bybit_tasks worker
