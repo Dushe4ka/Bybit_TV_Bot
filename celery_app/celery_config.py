@@ -18,7 +18,7 @@ if platform.system() == 'Windows':
 else:
     worker_pool = 'prefork'  # Используем prefork пул для Linux/Mac
 
-worker_concurrency = 4  # Уменьшаем количество воркеров для лучшей изоляции
+worker_concurrency = 30  # Уменьшаем количество воркеров для лучшей изоляции
 worker_prefetch_multiplier = 1  # Каждый воркер берет по одной задаче
 worker_max_tasks_per_child = 50  # Перезапуск воркера после 50 задач
 worker_max_memory_per_child = 150000  # Перезапуск воркера при превышении памяти (в КБ)
