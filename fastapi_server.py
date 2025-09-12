@@ -19,6 +19,10 @@ from logger_config import setup_logger
 # Настройка logger
 logger = setup_logger(__name__)
 
+# Проверяем конфигурацию
+if not TELEGRAM_BOT_TOKEN:
+    logger.warning("[CONFIG] TELEGRAM_BOT_TOKEN не настроен в переменных окружения")
+
 public_url = None
 
 @asynccontextmanager
@@ -35,7 +39,14 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"[NGROK] Ошибка при запуске ngrok: {e}")
             public_url = None
-    users = await get_all_subscribed_users()
+    # Получаем пользователей с обработкой ошибок
+    try:
+        users = await get_all_subscribed_users()
+        logger.info(f"[STARTUP] Найдено {len(users)} подписанных пользователей")
+    except Exception as e:
+        logger.error(f"[STARTUP] Ошибка при получении пользователей из БД: {e}")
+        users = []
+    
     # Автоматическое определение эндпоинтов
     endpoints = []
     for route in app.routes:
@@ -46,6 +57,7 @@ async def lifespan(app: FastAPI):
                     endpoints.append(f"{public_url}{route.path} [{methods}]")
                 else:
                     endpoints.append(f"/local{route.path} [{methods}]")
+    
     if public_url:
         msg = (
             f"🚀 FastAPI сервер запущен!\n"
@@ -58,7 +70,19 @@ async def lifespan(app: FastAPI):
             "Проверьте настройки ngrok!\n\n"
             f"Локальные эндпоинты:\n" + '\n'.join(endpoints)
         )
-    await send_message_to_telegram(msg, users, TELEGRAM_BOT_TOKEN)
+    
+    # Отправляем уведомление с проверкой токена
+    if TELEGRAM_BOT_TOKEN and users:
+        try:
+            await send_message_to_telegram(msg, users, TELEGRAM_BOT_TOKEN)
+            logger.info(f"[STARTUP] Уведомление отправлено {len(users)} пользователям")
+        except Exception as e:
+            logger.error(f"[STARTUP] Ошибка при отправке уведомления в Telegram: {e}")
+    else:
+        if not TELEGRAM_BOT_TOKEN:
+            logger.warning("[STARTUP] TELEGRAM_BOT_TOKEN не настроен, уведомление не отправлено")
+        if not users:
+            logger.warning("[STARTUP] Нет подписанных пользователей, уведомление не отправлено")
     yield
 
 app = FastAPI(lifespan=lifespan)
