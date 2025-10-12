@@ -4,6 +4,7 @@ import threading
 from bybit.open_order_tekprofit_stoploss import strong_short_strategy, short_strategy
 from bybit.weak_short_strategy import weak_short_strategy
 from bybit.position_monitor import position_monitor
+from bybit.averaging_strategy_celery import run_short_averaging_strategy
 from utils.signal_parser import process_signal
 from utils.send_tg_message import send_message_to_telegram
 from database import get_all_subscribed_users
@@ -28,6 +29,7 @@ def get_strategy_function(strategy_name: str):
         'strong_short_strategy': strong_short_strategy,
         'weak_short_strategy': weak_short_strategy,
         'short_strategy': short_strategy,  # Алиас для обратной совместимости
+        'short_averaging_strategy': run_short_averaging_strategy,  # Стратегия с усреднением
     }
     return strategy_functions.get(strategy_name)
 
@@ -186,4 +188,64 @@ def get_active_positions(self):
         
     except Exception as e:
         logger.error(f"[Bybit] Ошибка при получении активных позиций: {e}")
-        return {'status': 'error', 'error': str(e)} 
+        return {'status': 'error', 'error': str(e)}
+
+@celery_app.task(bind=True, name='celery_app.tasks.bybit_tasks.run_short_averaging_strategy')
+def run_short_averaging_strategy_task(
+    self, 
+    symbol: str,
+    usdt_amount: float = 100,
+    averaging_percent: float = 10.0,
+    initial_tp_percent: float = 3.0,
+    breakeven_step: float = 2.0,
+    stop_loss_percent: float = 15.0,
+    use_demo: bool = True
+):
+    """
+    Запускает стратегию SHORT с усреднением
+    
+    Args:
+        symbol: Торговый символ
+        usdt_amount: Сумма в USDT
+        averaging_percent: Процент усреднения
+        initial_tp_percent: Начальный тейк-профит
+        breakeven_step: Шаг безубытка
+        stop_loss_percent: Стоп-лосс
+        use_demo: Использовать демо-счет
+    """
+    clean_symbol = symbol.strip().strip("'\"")
+    logger.info(f"[Bybit] Запуск стратегии SHORT с усреднением для {clean_symbol}")
+    logger.info(
+        f"[Bybit] Параметры: USDT={usdt_amount}, Averaging={averaging_percent}%, "
+        f"TP={initial_tp_percent}%, BE Step={breakeven_step}%, SL={stop_loss_percent}%"
+    )
+    
+    try:
+        loop = get_or_create_event_loop()
+        logger.info(f"[Bybit] Используем event loop для {clean_symbol}: {loop}")
+        
+        result = loop.run_until_complete(
+            run_short_averaging_strategy(
+                symbol=clean_symbol,
+                usdt_amount=usdt_amount,
+                averaging_percent=averaging_percent,
+                initial_tp_percent=initial_tp_percent,
+                breakeven_step=breakeven_step,
+                stop_loss_percent=stop_loss_percent,
+                use_demo=use_demo
+            )
+        )
+        return {'status': 'success', 'symbol': clean_symbol, 'strategy': 'short_averaging'}
+        
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"[Bybit] Ошибка при запуске стратегии SHORT с усреднением для {clean_symbol}: {error_msg}")
+        
+        # Отправляем уведомление об ошибке
+        try:
+            loop = get_or_create_event_loop()
+            loop.run_until_complete(send_error_notification(clean_symbol, error_msg, "SHORT_AVERAGING"))
+        except Exception as notify_error:
+            logger.error(f"Не удалось отправить уведомление об ошибке: {notify_error}")
+        
+        return {'status': 'error', 'symbol': clean_symbol, 'error': error_msg} 

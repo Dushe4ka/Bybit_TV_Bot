@@ -5,6 +5,7 @@ from celery_app.tasks.bybit_tasks import (
     run_short_strategy, 
     run_strong_short_strategy, 
     run_weak_short_strategy,
+    run_short_averaging_strategy_task,
     stop_strategy_monitoring, 
     get_active_positions
 )
@@ -245,6 +246,71 @@ async def weak_short(request: Request):
     result = run_weak_short_strategy.delay(symbol)
     logger.info(f"[WEAK_SHORT] Задача на запуск WEAK SHORT стратегии для {symbol} отправлена в Celery")
     return {"status": "started", "symbol": symbol, "strategy": "weak_short", "task_id": result.id}
+
+@app.post("/short_averaging")
+async def short_averaging(request: Request):
+    """Запускает SHORT стратегию с усреднением"""
+    try:
+        data = await request.json()
+    except Exception:
+        body = await request.body()
+        try:
+            text = body.decode("utf-8").strip()
+        except Exception:
+            text = str(body)
+        if text:
+            data = {"text": text}
+        else:
+            logger.error("[SHORT_AVERAGING] Некорректный или пустой запрос")
+            raise HTTPException(status_code=400, detail="Некорректный или пустой JSON/text")
+    
+    symbol = data.get('text') or data.get('ticker') or data.get('symbol')
+    if symbol:
+        symbol = symbol.strip().strip("'\"")
+    
+    if not symbol:
+        logger.error("[SHORT_AVERAGING] Ошибка: не найден символ в payload")
+        return {"error": "No symbol in payload (expected 'text', 'ticker' or 'symbol')"}
+    
+    # Получаем параметры стратегии из запроса (или используем значения по умолчанию)
+    usdt_amount = float(data.get('usdt_amount', 100))
+    averaging_percent = float(data.get('averaging_percent', 10.0))
+    initial_tp_percent = float(data.get('initial_tp_percent', 3.0))
+    breakeven_step = float(data.get('breakeven_step', 2.0))
+    stop_loss_percent = float(data.get('stop_loss_percent', 15.0))
+    use_demo = data.get('use_demo', True)
+    
+    logger.info(
+        f"[SHORT_AVERAGING] Запуск стратегии для {symbol} с параметрами: "
+        f"USDT={usdt_amount}, Avg={averaging_percent}%, TP={initial_tp_percent}%, "
+        f"BE={breakeven_step}%, SL={stop_loss_percent}%"
+    )
+    
+    result = run_short_averaging_strategy_task.delay(
+        symbol=symbol,
+        usdt_amount=usdt_amount,
+        averaging_percent=averaging_percent,
+        initial_tp_percent=initial_tp_percent,
+        breakeven_step=breakeven_step,
+        stop_loss_percent=stop_loss_percent,
+        use_demo=use_demo
+    )
+    
+    logger.info(f"[SHORT_AVERAGING] Задача отправлена в Celery для {symbol}, task_id: {result.id}")
+    return {
+        "status": "started", 
+        "symbol": symbol, 
+        "strategy": "short_averaging",
+        "task_id": result.id,
+        "parameters": {
+            "usdt_amount": usdt_amount,
+            "averaging_percent": averaging_percent,
+            "initial_tp_percent": initial_tp_percent,
+            "breakeven_step": breakeven_step,
+            "stop_loss_percent": stop_loss_percent,
+            "use_demo": use_demo
+        }
+    }
 
 @app.post("/stop_monitoring")
 async def stop_monitoring(request: Request):

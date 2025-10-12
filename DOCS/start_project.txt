@@ -1,4 +1,4 @@
 server:
-    python -m main
+    python -m fastapi_server
 celery:
     celery -A celery_app.tasks.bybit_tasks worker

@@ -2,4 +2,4 @@ aiogram
 celery
 requests
 fastapi
-bybit
+pybit

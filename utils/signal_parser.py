@@ -93,8 +93,9 @@ def determine_signal_type(code: str) -> Optional[str]:
     
     # Словарь для сопоставления кодов с типами сигналов
     code_mapping = {
-        "CODE 1": "WEAK_SHORT",      # Code 1 = WEAK SHORT стратегия
-        "CODE 2": "STRONG_SHORT",    # Code 2 = STRONG SHORT стратегия
+        "CODE 1": "WEAK_SHORT",           # Code 1 = WEAK SHORT стратегия
+        "CODE 2": "STRONG_SHORT",         # Code 2 = STRONG SHORT стратегия
+        "CODE 3": "SHORT_AVERAGING",      # Code 3 = SHORT с усреднением
         # Можно добавить другие коды в будущем
     }
     
@@ -112,7 +113,7 @@ def get_strategy_function(signal_type: str) -> Optional[str]:
     Возвращает название функции стратегии для данного типа сигнала
     
     Args:
-        signal_type: Тип сигнала (STRONG_SHORT, WEAK_SHORT, etc.)
+        signal_type: Тип сигнала (STRONG_SHORT, WEAK_SHORT, SHORT_AVERAGING, etc.)
     
     Returns:
         Optional[str]: Название функции стратегии
@@ -120,6 +121,7 @@ def get_strategy_function(signal_type: str) -> Optional[str]:
     strategy_mapping = {
         "STRONG_SHORT": "strong_short_strategy",
         "WEAK_SHORT": "weak_short_strategy",
+        "SHORT_AVERAGING": "short_averaging_strategy",  # Стратегия с усреднением
         "STRONG_LONG": "strong_long_strategy",  # Пока не реализовано
         "WEAK_LONG": "weak_long_strategy",      # Пока не реализовано
     }
