@@ -107,6 +107,10 @@ class ShortAveragingStrategyCelery:
         self.ws = None
         self.should_stop = False
         
+        # Счетчик для периодического вывода статуса
+        self.message_counter = 0
+        self.status_interval = 10
+        
         logger.info(f"[{self.symbol}] Стратегия инициализирована")
 
     def _load_symbol_info(self):
@@ -129,11 +133,11 @@ class ShortAveragingStrategyCelery:
                     
                     self.qty_precision = len(str(qty_step).rstrip('0').split('.')[-1])
                     
-                    logger.info(
-                        f"[{self.symbol}] Информация о символе: "
-                        f"qty_step={qty_step}, precision={self.qty_precision}, "
-                        f"min={self.min_qty}, max={self.max_qty}"
-                    )
+                    logger.info(f"\n📊 Информация о символе {self.symbol}:")
+                    logger.info(f"   Шаг qty: {qty_step}")
+                    logger.info(f"   Точность: {self.qty_precision} знаков")
+                    logger.info(f"   Мин. qty: {self.min_qty}")
+                    logger.info(f"   Макс. qty: {self.max_qty}")
                 else:
                     logger.warning(f"[{self.symbol}] Символ не найден, используем значения по умолчанию")
                     self.qty_precision = 3
@@ -221,10 +225,10 @@ class ShortAveragingStrategyCelery:
             self.open_attempts += 1
             qty = self.calculate_qty(current_price)
             
-            logger.info(
-                f"[{self.symbol}] Попытка #{self.open_attempts}/{self.max_open_attempts} - "
-                f"Открываем ШОРТ. Цена: {current_price:.6f}, Qty: {qty}, Сумма: {self.usdt_amount} USDT"
-            )
+            logger.info(f"🚀 Попытка #{self.open_attempts}/{self.max_open_attempts} - Открываем ШОРТ позицию...")
+            logger.info(f"💰 Сумма: {self.usdt_amount} USDT")
+            logger.info(f"📊 Цена: {current_price:.8g}")
+            logger.info(f"📈 Количество: {qty} (точность: {self.qty_precision} знаков)")
             
             # Открываем шорт-позицию
             order = self.session.place_order(
@@ -243,10 +247,9 @@ class ShortAveragingStrategyCelery:
                 # Рассчитываем цену тейк-профита (для шорта это НИЖЕ)
                 self.tp_price = self.entry_price * (1 - self.initial_tp_percent / 100)
                 
-                logger.info(
-                    f"[{self.symbol}] ШОРТ позиция открыта! "
-                    f"Entry: {self.entry_price:.6f}, TP: {self.tp_price:.6f}"
-                )
+                logger.info("✅ ШОРТ позиция открыта!")
+                logger.info(f"💵 Цена входа: {self.entry_price:.8g}")
+                logger.info(f"🎯 Тейк-профит: {self.tp_price:.8g} (-{self.initial_tp_percent}%)")
                 
                 # Отправляем уведомление об открытии позиции
                 try:
@@ -287,10 +290,9 @@ class ShortAveragingStrategyCelery:
             averaging_price = self.entry_price * (1 + self.averaging_percent / 100)
             qty = self.calculate_qty(averaging_price)
             
-            logger.info(
-                f"[{self.symbol}] Выставляем лимитный ордер на усреднение: "
-                f"цена={averaging_price:.6f} (+{self.averaging_percent}%), qty={qty}"
-            )
+            logger.info("📝 Выставляем лимитный ордер на усреднение...")
+            logger.info(f"💰 Цена усреднения: {averaging_price:.8g} (+{self.averaging_percent}%)")
+            logger.info(f"📈 Количество: {qty} (округлено до {self.qty_precision} знаков)")
             
             order = self.session.place_order(
                 category="linear",
@@ -303,7 +305,7 @@ class ShortAveragingStrategyCelery:
             
             if order.get('retCode') == 0:
                 self.averaging_order_id = order.get('result', {}).get('orderId')
-                logger.info(f"[{self.symbol}] Лимитный ордер выставлен! ID: {self.averaging_order_id}")
+                logger.info(f"✅ Лимитный ордер выставлен! ID: {self.averaging_order_id}")
                 
                 # Отправляем уведомление
                 try:
@@ -630,9 +632,33 @@ class ShortAveragingStrategyCelery:
                     success = loop.run_until_complete(self.open_short_position(current_price))
                     loop.close()
                     
+                    if success:
+                        logger.info("✅ ШОРТ позиция успешно открыта!")
+                    
                     if not success and self.failed_to_open:
                         self.should_stop = True
                     return
+                
+                # Рассчитываем текущий PnL для отображения
+                if self.position_opened:
+                    base_price = self.averaged_price if self.is_averaged else self.entry_price
+                    profit_percent = (base_price - current_price) / base_price * 100
+                    
+                    # Выбираем emoji в зависимости от прибыли/убытка
+                    pnl_emoji = "📈" if profit_percent >= 0 else "📉"
+                    pnl_sign = "+" if profit_percent >= 0 else ""
+                    
+                    # Выводим информацию о цене и PnL
+                    logger.info(f"💰 Цена: {current_price:.8g} | {pnl_emoji} PnL: {pnl_sign}{profit_percent:.2f}%")
+                    
+                    # Периодический вывод статуса каждые N обновлений
+                    self.message_counter += 1
+                    if self.message_counter % self.status_interval == 0:
+                        averaged_status = "ДА" if self.is_averaged else "НЕТ"
+                        logger.info(
+                            f"🔧 Статус: Позиция ОТКРЫТА (ШОРТ), "
+                            f"Усреднение={averaged_status}, PnL={pnl_sign}{profit_percent:.2f}%"
+                        )
                 
                 # Обновляем стратегию
                 loop = asyncio.new_event_loop()
@@ -658,12 +684,18 @@ class ShortAveragingStrategyCelery:
     async def run(self):
         """Запускает стратегию через WebSocket"""
         try:
-            logger.info(f"[{self.symbol}] Запуск стратегии SHORT с усреднением")
-            logger.info(
-                f"[{self.symbol}] Параметры: USDT={self.usdt_amount}, "
-                f"Averaging={self.averaging_percent}%, TP={self.initial_tp_percent}%, "
-                f"BE Step={self.breakeven_step}%, SL={self.stop_loss_percent}%"
-            )
+            logger.info("\n" + "=" * 60)
+            logger.info("🤖 СТРАТЕГИЯ ШОРТ С УСРЕДНЕНИЕМ ЗАПУЩЕНА")
+            logger.info("=" * 60)
+            logger.info(f"📊 Символ: {self.symbol}")
+            logger.info(f"💰 Сумма на сделку: {self.usdt_amount} USDT")
+            logger.info(f"📏 Точность qty: {self.qty_precision} знаков (мин: {self.min_qty}, макс: {self.max_qty})")
+            logger.info(f"📈 Процент усреднения: {self.averaging_percent}%")
+            logger.info(f"🎯 Тейк-профит: {self.initial_tp_percent}%")
+            logger.info(f"🔒 Шаг безубытка: {self.breakeven_step}%")
+            logger.info(f"🛡️ Стоп-лосс (после усреднения): {self.stop_loss_percent}%")
+            logger.info(f"🔄 Максимум попыток открытия: {self.max_open_attempts}")
+            logger.info("=" * 60)
             
             # Инициализируем WebSocket
             self.ws = WebSocket(testnet=False, channel_type="linear")
@@ -675,7 +707,9 @@ class ShortAveragingStrategyCelery:
             while not self.should_stop:
                 await asyncio.sleep(1)
             
-            logger.info(f"[{self.symbol}] Стратегия завершена")
+            logger.info("\n" + "=" * 60)
+            logger.info(f"🏁 СТРАТЕГИЯ ДЛЯ {self.symbol} ЗАВЕРШЕНА")
+            logger.info("=" * 60)
             
         except Exception as e:
             logger.error(f"[{self.symbol}] Ошибка выполнения стратегии: {e}")
