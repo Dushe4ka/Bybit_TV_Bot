@@ -358,4 +358,4 @@ def health():
 if __name__ == "__main__":
     import uvicorn
     logger.info("[START] Запуск FastAPI сервера через uvicorn на 0.0.0.0:8000")
-    uvicorn.run("fastapi_server:app", host="0.0.0.0", port=8000, reload=False) 
+    uvicorn.run("fastapi_server:app", host="0.0.0.0", port=9000, reload=False)
