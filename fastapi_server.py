@@ -34,7 +34,7 @@ async def lifespan(app: FastAPI):
         try:
             from pyngrok import ngrok
             ngrok.set_auth_token(NGROK_TOKEN)
-            ngrok_tunnel = ngrok.connect(8000, bind_tls=True)
+            ngrok_tunnel = ngrok.connect(9000, bind_tls=True)
             public_url = ngrok_tunnel.public_url
             logger.info(f"[NGROK] Сервер доступен по адресу: {public_url}")
         except Exception as e:
@@ -358,4 +358,4 @@ def health():
 if __name__ == "__main__":
     import uvicorn
     logger.info("[START] Запуск FastAPI сервера через uvicorn на 0.0.0.0:8000")
-    uvicorn.run("fastapi_server:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("fastapi_server:app", host="0.0.0.0", port=9000, reload=False)
