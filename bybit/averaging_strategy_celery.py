@@ -546,6 +546,17 @@ class ShortAveragingStrategyCelery:
         
         return False
 
+    def stop_websocket(self):
+        """Останавливает WebSocket соединение"""
+        try:
+            if self.ws:
+                logger.info(f"[{self.symbol}] Закрываем WebSocket соединение...")
+                self.ws.exit()
+                self.ws = None
+                logger.info(f"[{self.symbol}] WebSocket соединение закрыто")
+        except Exception as e:
+            logger.warning(f"[{self.symbol}] Ошибка при закрытии WebSocket: {e}")
+    
     async def close_position(self) -> bool:
         """Закрывает позицию"""
         try:
@@ -618,6 +629,10 @@ class ShortAveragingStrategyCelery:
     def handle_message(self, message):
         """Обработчик сообщений из WebSocket"""
         try:
+            # Если уже установлен флаг остановки, игнорируем все сообщения
+            if self.should_stop:
+                return
+            
             if 'data' in message:
                 data = message['data']
                 current_price = float(data.get('lastPrice', 0))
@@ -637,6 +652,7 @@ class ShortAveragingStrategyCelery:
                     
                     if not success and self.failed_to_open:
                         self.should_stop = True
+                        self.stop_websocket()
                     return
                 
                 # Рассчитываем текущий PnL для отображения
@@ -673,10 +689,18 @@ class ShortAveragingStrategyCelery:
                     loop.run_until_complete(self.close_position())
                     loop.close()
                     self.should_stop = True
+                    self.stop_websocket()
                     
                 elif action == "STOP":
-                    logger.warning(f"[{self.symbol}] Алгоритм остановлен (позиция закрыта вручную)")
+                    logger.warning(f"⚠️ [{self.symbol}] Позиция закрыта вручную! Останавливаем мониторинг...")
+                    # Пытаемся отменить лимитный ордер если он еще активен
+                    if not self.is_averaged and self.averaging_order_id:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        loop.run_until_complete(self.cancel_averaging_order())
+                        loop.close()
                     self.should_stop = True
+                    self.stop_websocket()
                 
         except Exception as e:
             logger.error(f"[{self.symbol}] Ошибка обработки сообщения: {e}")
@@ -703,9 +727,9 @@ class ShortAveragingStrategyCelery:
             # Запускаем подписку на тикер
             self.ws.ticker_stream(self.symbol, self.handle_message)
             
-            # Ждем остановки
+            # Ждем остановки (проверяем чаще для быстрой реакции)
             while not self.should_stop:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
             
             logger.info("\n" + "=" * 60)
             logger.info(f"🏁 СТРАТЕГИЯ ДЛЯ {self.symbol} ЗАВЕРШЕНА")
@@ -725,6 +749,17 @@ class ShortAveragingStrategyCelery:
                 logger.error(f"[{self.symbol}] Ошибка отправки уведомления: {notify_error}")
             
             raise
+        
+        finally:
+            # Гарантированно закрываем WebSocket при завершении (успешном или с ошибкой)
+            if self.ws:
+                logger.info(f"[{self.symbol}] Закрываем WebSocket соединение (finally)...")
+                try:
+                    self.ws.exit()
+                except Exception as e:
+                    logger.warning(f"[{self.symbol}] Ошибка при закрытии WebSocket в finally: {e}")
+                finally:
+                    self.ws = None
 
 
 async def run_short_averaging_strategy(
