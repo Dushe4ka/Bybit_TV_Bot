@@ -205,3 +205,4 @@ celery -A celery_app inspect ping
 - **Документация Redis**: https://redis.io/docs/
 - **pybit**: https://github.com/bybit-exchange/pybit
 
+
