@@ -181,5 +181,32 @@ def test_signal_parsing():
         else:
             print(f"❌ Не удалось обработать сигнал")
 
+def clean_symbol(symbol: str) -> str:
+    """
+    Очищает символ от кавычек, пробелов и суффиксов TradingView
+    
+    Args:
+        symbol: Исходный символ
+        
+    Returns:
+        Очищенный символ
+    """
+    if not symbol:
+        return symbol
+    
+    # Убираем кавычки и пробелы
+    cleaned = symbol.strip().strip("'\"")
+    
+    # Убираем суффиксы TradingView (.P, .PERP и т.д.)
+    suffixes_to_remove = ['.P', '.PERP', '.PERPETUAL']
+    for suffix in suffixes_to_remove:
+        if cleaned.upper().endswith(suffix):
+            original = cleaned
+            cleaned = cleaned[:-len(suffix)]
+            logger.info(f"Удален суффикс {suffix} из символа: {original} -> {cleaned}")
+            break
+    
+    return cleaned
+
 if __name__ == "__main__":
     test_signal_parsing() 

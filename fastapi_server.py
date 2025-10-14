@@ -10,7 +10,7 @@ from celery_app.tasks.bybit_tasks import (
     get_active_positions
 )
 from utils.send_tg_message import send_message_to_telegram
-from utils.signal_parser import process_signal
+from utils.signal_parser import process_signal, clean_symbol
 from database import get_all_subscribed_users
 from config import TELEGRAM_BOT_TOKEN, NGROK_TOKEN
 import asyncio
@@ -267,6 +267,7 @@ async def short_averaging(request: Request):
     symbol = data.get('text') or data.get('ticker') or data.get('symbol')
     if symbol:
         symbol = symbol.strip().strip("'\"")
+        symbol = clean_symbol(symbol)
     
     if not symbol:
         logger.error("[SHORT_AVERAGING] Ошибка: не найден символ в payload")
