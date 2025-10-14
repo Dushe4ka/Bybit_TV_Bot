@@ -65,6 +65,11 @@ def parse_signal(signal_text: str) -> Tuple[Optional[str], Optional[str]]:
             # Очищаем символ
             symbol = coin.strip().upper()
             
+            # Удаляем суффикс .P если он есть (TradingView добавляет его для perpetual контрактов)
+            if symbol.endswith('.P'):
+                symbol = symbol[:-2]
+                logger.info(f"[SignalParser] Удален суффикс .P из символа: {coin} -> {symbol}")
+            
             # Определяем тип сигнала на основе кода
             signal_type = determine_signal_type(code)
             
