@@ -31,7 +31,7 @@ DEFAULT_STOP_LOSS_PERCENT = 15.0
 
 
 class ShortAveragingStrategyCelery:
-    """Стратегия шорт-позиций с усреднением для работы через Celery - БЫСТРАЯ ВЕРСИЯ"""
+    """Стратегия шорт-позиций с усреднением для работы через Celery"""
     
     def __init__(
         self,
@@ -111,28 +111,7 @@ class ShortAveragingStrategyCelery:
         self.message_counter = 0
         self.status_interval = 10
         
-        # ✨ НОВОЕ: Один event loop для всех операций
-        self.loop = None
-        
-        # ✨ НОВОЕ: Отслеживание пиковой прибыли (важно!)
-        self.peak_profit_percent = 0.0
-        self.peak_price = None
-        
-        # ✨ НОВОЕ: Редкие проверки (ТОЛЬКО для некритичных операций)
-        self.last_position_check = 0
-        self.position_check_interval = 5.0  # Проверяем существование позиции раз в 5 секунд
-        self.last_averaging_check = 0
-        self.averaging_check_interval = 0.5  # Проверяем усреднение раз в 0.5 сек
-        
-        # ✨ НОВОЕ: Уменьшаем частоту логирования
-        self.log_counter = 0
-        self.log_interval = 10  # Логируем каждый 10-й тик
-        
-        # ✨ НОВОЕ: Счетчик обработанных тиков для статистики
-        self.ticks_processed = 0
-        self.start_time = None
-        
-        logger.info(f"[{self.symbol}] Стратегия инициализирована в БЫСТРОМ режиме")
+        logger.info(f"[{self.symbol}] Стратегия инициализирована")
 
     def _load_symbol_info(self):
         """Загружает информацию о символе и правилах торговли"""
@@ -432,39 +411,32 @@ class ShortAveragingStrategyCelery:
             logger.error(f"[{self.symbol}] Ошибка применения усреднения: {e}")
             return False
 
-    async def update(self, current_price: float, current_time: float) -> Optional[str]:
-        """Обновляет состояние стратегии - ПРОВЕРЯЕТ КАЖДЫЙ ТИК"""
+    async def update(self, current_price: float) -> Optional[str]:
+        """Обновляет состояние стратегии на основе текущей цены"""
         
         if not self.position_opened:
             return None
         
-        # ✨ КРИТИЧНО: Проверяем существование позиции РЕДКО (это медленный HTTP запрос)
-        if current_time - self.last_position_check > self.position_check_interval:
-            if not self.check_position_exists():
-                logger.warning(f"[{self.symbol}] Позиция закрыта вручную или не существует!")
-                return "STOP"
-            self.last_position_check = current_time
+        # Проверяем существование позиции на бирже
+        if not self.check_position_exists():
+            logger.warning(f"[{self.symbol}] Позиция закрыта вручную или не существует!")
+            return "STOP"
         
         # Определяем базовую цену для расчетов
         base_price = self.averaged_price if self.is_averaged else self.entry_price
         
-        # ✨ КРИТИЧНО: Рассчитываем прибыль на КАЖДОМ тике
+        # Рассчитываем текущую прибыль для шорта
         profit_percent = (base_price - current_price) / base_price * 100
         
-        # ✨ НОВОЕ: Отслеживаем пиковую прибыль
-        if profit_percent > self.peak_profit_percent:
-            self.peak_profit_percent = profit_percent
-            self.peak_price = current_price
-        
-        # ✅ КРИТИЧНО: Проверяем стоп-лосс НА КАЖДОМ ТИКЕ (без кэширования!)
+        # Проверяем стоп-лосс (только после усреднения)
         if self.is_averaged and self.stop_loss_price:
             if current_price >= self.stop_loss_price:
                 logger.warning(
-                    f"[{self.symbol}] 🚨 Стоп-лосс сработал! "
+                    f"[{self.symbol}] Стоп-лосс сработал! "
                     f"Цена: {current_price:.6f} >= {self.stop_loss_price:.6f}"
                 )
                 
-                # Уведомление - НЕ блокируем, отправляем асинхронно
+                # Уведомляем о срабатывании стоп-лосса
                 try:
                     chat_ids = await get_all_subscribed_users()
                     await notify_stop_loss_triggered(
@@ -472,29 +444,26 @@ class ShortAveragingStrategyCelery:
                         current_price, self.stop_loss_price
                     )
                 except Exception as e:
-                    logger.error(f"[{self.symbol}] Ошибка уведомления: {e}")
+                    logger.error(f"[{self.symbol}] Ошибка отправки уведомления: {e}")
                 
                 return "CLOSE"
         
-        # ✨ ОПТИМИЗАЦИЯ: Проверяем усреднение чаще, но не на каждом тике
-        if not self.is_averaged:
-            if current_time - self.last_averaging_check > self.averaging_check_interval:
-                if self.check_averaging_order_filled():
-                    await self.apply_averaging(current_price)
-                self.last_averaging_check = current_time
+        # Проверяем, был ли исполнен ордер на усреднение
+        if not self.is_averaged and self.check_averaging_order_filled():
+            await self.apply_averaging(current_price)
         
-        # ✅ КРИТИЧНО: Логика тейк-профита - ПРОВЕРЯЕМ КАЖДЫЙ ТИК!
+        # Логика тейк-профита и безубытка
         if profit_percent >= self.initial_tp_percent:
             if not self.breakeven_price:
                 # Первый раз достигли TP
                 self.breakeven_price = base_price * (1 - self.initial_tp_percent / 100)
                 self.best_profit_percent = profit_percent
                 logger.info(
-                    f"[{self.symbol}] 🎯 Достигнут TP {self.initial_tp_percent}%! "
+                    f"[{self.symbol}] Достигнут TP {self.initial_tp_percent}%! "
                     f"Безубыток: {self.breakeven_price:.6f}"
                 )
                 
-                # Уведомление асинхронно
+                # Уведомляем о достижении TP
                 try:
                     chat_ids = await get_all_subscribed_users()
                     await notify_take_profit_reached(
@@ -502,9 +471,9 @@ class ShortAveragingStrategyCelery:
                         current_price, profit_percent, self.breakeven_price
                     )
                 except Exception as e:
-                    logger.error(f"[{self.symbol}] Ошибка уведомления: {e}")
+                    logger.error(f"[{self.symbol}] Ошибка отправки уведомления: {e}")
             else:
-                # Проверяем шаги безубытка
+                # Проверяем шаг в 2%
                 steps_passed = int((profit_percent - self.initial_tp_percent) / self.breakeven_step)
                 target_breakeven_percent = self.initial_tp_percent + steps_passed * self.breakeven_step
                 new_breakeven = base_price * (1 - target_breakeven_percent / 100)
@@ -514,10 +483,11 @@ class ShortAveragingStrategyCelery:
                     self.breakeven_price = new_breakeven
                     self.best_profit_percent = profit_percent
                     logger.info(
-                        f"[{self.symbol}] 🔒 Безубыток перемещен: {old_breakeven:.6f} -> "
+                        f"[{self.symbol}] Безубыток перемещен с {old_breakeven:.6f} на "
                         f"{self.breakeven_price:.6f} ({target_breakeven_percent:.1f}%)"
                     )
                     
+                    # Уведомляем о перемещении безубытка
                     try:
                         chat_ids = await get_all_subscribed_users()
                         await notify_breakeven_moved(
@@ -525,14 +495,13 @@ class ShortAveragingStrategyCelery:
                             self.breakeven_price, target_breakeven_percent, profit_percent
                         )
                     except Exception as e:
-                        logger.error(f"[{self.symbol}] Ошибка уведомления: {e}")
+                        logger.error(f"[{self.symbol}] Ошибка отправки уведомления: {e}")
         
-        # ✅ КРИТИЧНО: Проверяем безубыток НА КАЖДОМ ТИКЕ!
+        # Проверяем срабатывание безубытка
         if self.breakeven_price and current_price >= self.breakeven_price:
             logger.info(
-                f"[{self.symbol}] 🏁 Безубыток сработал! "
-                f"Цена: {current_price:.6f} >= {self.breakeven_price:.6f} "
-                f"(Пик прибыли был: {self.peak_profit_percent:.2f}%)"
+                f"[{self.symbol}] Безубыток сработал! "
+                f"Цена: {current_price:.6f} >= {self.breakeven_price:.6f}"
             )
             return "CLOSE"
         
@@ -658,149 +627,118 @@ class ShortAveragingStrategyCelery:
             return False
 
     def handle_message(self, message):
-        """Обработчик сообщений из WebSocket - МАКСИМАЛЬНО БЫСТРЫЙ"""
+        """Обработчик сообщений из WebSocket"""
         try:
-            # Ранний выход при остановке
+            # Если уже установлен флаг остановки, игнорируем все сообщения
             if self.should_stop:
                 return
             
-            if 'data' not in message:
-                return
-            
-            data = message['data']
-            current_price = float(data.get('lastPrice', 0))
-            
-            if current_price <= 0:
-                return
-            
-            # ✨ Импортируем time один раз в начале класса
-            import time
-            current_time = time.time()
-            
-            # Инициализация времени старта
-            if self.start_time is None:
-                self.start_time = current_time
-            
-            self.ticks_processed += 1
-            
-            # Автоматическое открытие позиции
-            if not self.position_opened and not self.failed_to_open:
-                if not self.loop:
-                    self.loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(self.loop)
+            if 'data' in message:
+                data = message['data']
+                current_price = float(data.get('lastPrice', 0))
                 
-                success = self.loop.run_until_complete(self.open_short_position(current_price))
-                
-                if success:
-                    logger.info("✅ ШОРТ позиция успешно открыта!")
-                
-                if not success and self.failed_to_open:
-                    self.should_stop = True
-                    self.stop_websocket()
-                return
-            
-            # ✨ Если позиция открыта, делаем БЫСТРЫЕ локальные расчеты
-            if self.position_opened:
-                base_price = self.averaged_price if self.is_averaged else self.entry_price
-                profit_percent = (base_price - current_price) / base_price * 100
-                
-                # ✨ КРИТИЧНО: Мгновенная проверка безубытка ПЕРЕД всем остальным!
-                if self.breakeven_price and current_price >= self.breakeven_price:
-                    logger.warning(f"🚨 МГНОВЕННОЕ срабатывание безубытка на {profit_percent:.2f}%!")
-                    if not self.loop:
-                        self.loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(self.loop)
-                    self.loop.run_until_complete(self.close_position())
-                    self.should_stop = True
-                    self.stop_websocket()
+                if current_price <= 0:
                     return
                 
-                # Логируем редко
-                self.log_counter += 1
-                if self.log_counter % self.log_interval == 0:
+                # Автоматическое открытие позиции (если не открыта)
+                if not self.position_opened and not self.failed_to_open:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    success = loop.run_until_complete(self.open_short_position(current_price))
+                    loop.close()
+                    
+                    if success:
+                        logger.info("✅ ШОРТ позиция успешно открыта!")
+                    
+                    if not success and self.failed_to_open:
+                        self.should_stop = True
+                        self.stop_websocket()
+                    return
+                
+                # Рассчитываем текущий PnL для отображения
+                if self.position_opened:
+                    base_price = self.averaged_price if self.is_averaged else self.entry_price
+                    profit_percent = (base_price - current_price) / base_price * 100
+                    
+                    # Выбираем emoji в зависимости от прибыли/убытка
                     pnl_emoji = "📈" if profit_percent >= 0 else "📉"
                     pnl_sign = "+" if profit_percent >= 0 else ""
                     
-                    # Статистика скорости обработки
-                    elapsed = current_time - self.start_time
-                    ticks_per_sec = self.ticks_processed / elapsed if elapsed > 0 else 0
+                    # Выводим информацию о цене и PnL
+                    logger.info(f"💰 Цена: {current_price:.8g} | {pnl_emoji} PnL: {pnl_sign}{profit_percent:.2f}%")
                     
-                    logger.info(
-                        f"💰 Цена: {current_price:.8g} | {pnl_emoji} PnL: {pnl_sign}{profit_percent:.2f}% "
-                        f"(Пик: {self.peak_profit_percent:.2f}%) | ⚡ {ticks_per_sec:.1f} тиков/сек"
-                    )
+                    # Периодический вывод статуса каждые N обновлений
+                    self.message_counter += 1
+                    if self.message_counter % self.status_interval == 0:
+                        averaged_status = "ДА" if self.is_averaged else "НЕТ"
+                        logger.info(
+                            f"🔧 Статус: Позиция ОТКРЫТА (ШОРТ), "
+                            f"Усреднение={averaged_status}, PnL={pnl_sign}{profit_percent:.2f}%"
+                        )
                 
-                # Периодический статус
-                self.message_counter += 1
-                if self.message_counter % self.status_interval == 0:
-                    averaged_status = "ДА" if self.is_averaged else "НЕТ"
-                    logger.info(
-                        f"🔧 Позиция ОТКРЫТА | Усреднение={averaged_status} | "
-                        f"PnL={profit_percent:+.2f}% | Обработано {self.ticks_processed} тиков"
-                    )
-            
-            # Создаем loop если нужно
-            if not self.loop:
-                self.loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(self.loop)
-            
-            # ✅ Основная логика update - проверяет ВСЕ на каждом тике
-            action = self.loop.run_until_complete(self.update(current_price, current_time))
-            
-            if action == "CLOSE":
-                logger.info(f"[{self.symbol}] Условие закрытия! Макс прибыль: {self.peak_profit_percent:.2f}%")
-                self.loop.run_until_complete(self.close_position())
-                self.should_stop = True
-                self.stop_websocket()
+                # Обновляем стратегию
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                action = loop.run_until_complete(self.update(current_price))
+                loop.close()
                 
-            elif action == "STOP":
-                logger.warning(f"⚠️ [{self.symbol}] Позиция закрыта вручную!")
-                if not self.is_averaged and self.averaging_order_id:
-                    self.loop.run_until_complete(self.cancel_averaging_order())
-                self.should_stop = True
-                self.stop_websocket()
+                if action == "CLOSE":
+                    logger.info(f"[{self.symbol}] Условие закрытия сработало!")
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(self.close_position())
+                    loop.close()
+                    self.should_stop = True
+                    self.stop_websocket()
+                    
+                elif action == "STOP":
+                    logger.warning(f"⚠️ [{self.symbol}] Позиция закрыта вручную! Останавливаем мониторинг...")
+                    # Пытаемся отменить лимитный ордер если он еще активен
+                    if not self.is_averaged and self.averaging_order_id:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        loop.run_until_complete(self.cancel_averaging_order())
+                        loop.close()
+                    self.should_stop = True
+                    self.stop_websocket()
                 
         except Exception as e:
-            logger.error(f"[{self.symbol}] Ошибка обработки: {e}", exc_info=True)
+            logger.error(f"[{self.symbol}] Ошибка обработки сообщения: {e}")
 
     async def run(self):
         """Запускает стратегию через WebSocket"""
         try:
             logger.info("\n" + "=" * 60)
-            logger.info("🚀 СТРАТЕГИЯ ШОРТ С УСРЕДНЕНИЕМ (БЫСТРАЯ ВЕРСИЯ)")
+            logger.info("🤖 СТРАТЕГИЯ ШОРТ С УСРЕДНЕНИЕМ ЗАПУЩЕНА")
             logger.info("=" * 60)
             logger.info(f"📊 Символ: {self.symbol}")
-            logger.info(f"💰 Сумма: {self.usdt_amount} USDT")
-            logger.info(f"📏 Точность: {self.qty_precision} знаков (мин: {self.min_qty})")
-            logger.info(f"📈 Усреднение: {self.averaging_percent}%")
+            logger.info(f"💰 Сумма на сделку: {self.usdt_amount} USDT")
+            logger.info(f"📏 Точность qty: {self.qty_precision} знаков (мин: {self.min_qty}, макс: {self.max_qty})")
+            logger.info(f"📈 Процент усреднения: {self.averaging_percent}%")
             logger.info(f"🎯 Тейк-профит: {self.initial_tp_percent}%")
-            logger.info(f"🔒 Безубыток шаг: {self.breakeven_step}%")
-            logger.info(f"🛡️ Стоп-лосс: {self.stop_loss_percent}%")
-            logger.info(f"⚡ Режим: ПРОВЕРКА КАЖДОГО ТИКА")
+            logger.info(f"🔒 Шаг безубытка: {self.breakeven_step}%")
+            logger.info(f"🛡️ Стоп-лосс (после усреднения): {self.stop_loss_percent}%")
+            logger.info(f"🔄 Максимум попыток открытия: {self.max_open_attempts}")
             logger.info("=" * 60)
-            
-            # ✨ Создаем ОДИН event loop для всей стратегии
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
             
             # Инициализируем WebSocket
             self.ws = WebSocket(testnet=False, channel_type="linear")
             
-            # Подписка на тикер
+            # Запускаем подписку на тикер
             self.ws.ticker_stream(self.symbol, self.handle_message)
             
-            # Ждем остановки
+            # Ждем остановки (проверяем чаще для быстрой реакции)
             while not self.should_stop:
-                await asyncio.sleep(0.1)  # Проверяем чаще для быстрой реакции
+                await asyncio.sleep(0.5)
             
             logger.info("\n" + "=" * 60)
-            logger.info(f"🏁 СТРАТЕГИЯ ЗАВЕРШЕНА | Обработано {self.ticks_processed} тиков")
-            logger.info(f"📊 Максимальная прибыль: {self.peak_profit_percent:.2f}%")
+            logger.info(f"🏁 СТРАТЕГИЯ ДЛЯ {self.symbol} ЗАВЕРШЕНА")
             logger.info("=" * 60)
             
         except Exception as e:
-            logger.error(f"[{self.symbol}] Критическая ошибка: {e}", exc_info=True)
+            logger.error(f"[{self.symbol}] Ошибка выполнения стратегии: {e}")
             
+            # Уведомляем об ошибке
             try:
                 chat_ids = await get_all_subscribed_users()
                 await notify_strategy_error(
@@ -808,22 +746,18 @@ class ShortAveragingStrategyCelery:
                     str(e), "SHORT_AVERAGING"
                 )
             except Exception as notify_error:
-                logger.error(f"Ошибка уведомления: {notify_error}")
+                logger.error(f"[{self.symbol}] Ошибка отправки уведомления: {notify_error}")
             
             raise
         
         finally:
-            # Закрываем event loop
-            if self.loop and not self.loop.is_closed():
-                self.loop.close()
-                self.loop = None
-            
-            # Закрываем WebSocket
+            # Гарантированно закрываем WebSocket при завершении (успешном или с ошибкой)
             if self.ws:
+                logger.info(f"[{self.symbol}] Закрываем WebSocket соединение (finally)...")
                 try:
                     self.ws.exit()
                 except Exception as e:
-                    logger.warning(f"Ошибка закрытия WS: {e}")
+                    logger.warning(f"[{self.symbol}] Ошибка при закрытии WebSocket в finally: {e}")
                 finally:
                     self.ws = None
 
