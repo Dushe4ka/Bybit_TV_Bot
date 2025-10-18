@@ -17,6 +17,7 @@ from utils.send_tg_message import (
     notify_stop_loss_triggered,
     notify_strategy_error
 )
+from bybit.stop_all_orders import stop_trading_by_symbol
 from logger_config import setup_logger
 
 logger = setup_logger(__name__)
@@ -671,11 +672,11 @@ class ShortAveragingStrategyCelery:
             logger.warning(f"[{self.symbol}] Ошибка при закрытии WebSocket: {e}")
     
     async def close_position(self) -> bool:
-        """Закрывает позицию"""
+        """Закрывает позицию используя stop_trading_by_symbol"""
         try:
             logger.info(f"[{self.symbol}] Закрываем позицию...")
             
-            # Получаем текущую цену
+            # Получаем текущую цену для расчетов
             response = self.session.get_tickers(
                 category="linear",
                 symbol=self.symbol
@@ -686,56 +687,42 @@ class ShortAveragingStrategyCelery:
                 if len(tickers) > 0:
                     current_price = float(tickers[0].get('lastPrice', 0))
             
-            # Отменяем ордер на усреднение если он еще активен
-            if not self.is_averaged and self.averaging_order_id:
-                await self.cancel_averaging_order()
+            # ✨ НОВОЕ: Используем надежную функцию stop_trading_by_symbol
+            logger.info(f"[{self.symbol}] Используем stop_trading_by_symbol для надежного закрытия...")
+            stop_trading_by_symbol(self.symbol)
             
-            # Закрываем позицию (для закрытия шорта нужен Buy)
-            order = self.session.place_order(
-                category="linear",
-                symbol=self.symbol,
-                side="Buy",
-                orderType="Market",
-                qty=self.position_qty,
+            logger.info(f"[{self.symbol}] Позиция успешно закрыта через stop_trading_by_symbol!")
+            
+            # ✨ ИСПРАВЛЕНИЕ: Рассчитываем прибыль/убыток относительно правильной базовой цены
+            if self.is_averaged and self.averaged_price:
+                base_price = self.averaged_price
+            else:
+                base_price = self.entry_price
+            
+            profit_percent = None
+            profit_usdt = None
+            
+            if current_price and base_price:
+                profit_percent = (base_price - current_price) / base_price * 100
+                profit_usdt = (base_price - current_price) * self.position_qty
+            
+            # Определяем причину закрытия
+            close_reason = "BREAKEVEN"
+            if self.is_averaged and self.stop_loss_price and current_price:
+                if current_price >= self.stop_loss_price:
+                    close_reason = "STOP_LOSS"
+            
+            # Отправляем уведомление о закрытии
+            chat_ids = await get_all_subscribed_users()
+            await self.safe_send_notification(
+                notify_position_closed,
+                chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
+                close_reason, base_price, current_price or 0,
+                self.position_qty, profit_percent, profit_usdt,
+                self.is_averaged
             )
             
-            if order.get('retCode') == 0:
-                logger.info(f"[{self.symbol}] Позиция успешно закрыта!")
-                
-                # ✨ ИСПРАВЛЕНИЕ: Рассчитываем прибыль/убыток относительно правильной базовой цены
-                if self.is_averaged and self.averaged_price:
-                    base_price = self.averaged_price
-                else:
-                    base_price = self.entry_price
-                
-                profit_percent = None
-                profit_usdt = None
-                
-                if current_price and base_price:
-                    profit_percent = (base_price - current_price) / base_price * 100
-                    profit_usdt = (base_price - current_price) * self.position_qty
-                
-                # Определяем причину закрытия
-                close_reason = "BREAKEVEN"
-                if self.is_averaged and self.stop_loss_price and current_price:
-                    if current_price >= self.stop_loss_price:
-                        close_reason = "STOP_LOSS"
-                
-                # Отправляем уведомление о закрытии
-                chat_ids = await get_all_subscribed_users()
-                await self.safe_send_notification(
-                    notify_position_closed,
-                    chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
-                    close_reason, base_price, current_price or 0,
-                    self.position_qty, profit_percent, profit_usdt,
-                    self.is_averaged
-                )
-                
-                return True
-            else:
-                error_msg = order.get('retMsg', 'Неизвестная ошибка')
-                logger.error(f"[{self.symbol}] Ошибка закрытия позиции: {error_msg}")
-                return False
+            return True
                 
         except Exception as e:
             logger.error(f"[{self.symbol}] Исключение при закрытии позиции: {e}")
