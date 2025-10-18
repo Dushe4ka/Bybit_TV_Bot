@@ -3,9 +3,8 @@
 Адаптированная версия для приема сигналов через вебхуки
 """
 from pybit.unified_trading import WebSocket, HTTP
-from time import sleep
 import asyncio
-from typing import Optional, Dict, Any
+from typing import Optional
 from config import API_KEY, API_SECRET, DEMO_API_KEY, DEMO_API_SECRET, TELEGRAM_BOT_TOKEN
 from database import get_all_subscribed_users
 from utils.send_tg_message import (
@@ -83,13 +82,15 @@ class ShortAveragingStrategyCelery:
         
         # Состояние позиции
         self.position_qty = 0
-        self.entry_price = None
-        self.averaged_price = None
+        self.entry_price = None  # Изначальная цена входа
+        self.initial_entry_price = None  # Сохраняем изначальную цену для расчетов
+        self.averaged_price = None  # Средняя цена входа (получаем из API)
         self.is_averaged = False
         self.averaging_order_id = None
         
         # Состояние тейк-профита и безубытка
         self.tp_price = None
+        self.fake_tp_price = None  # ✨ НОВОЕ: 2% фиктивный TP после усреднения
         self.breakeven_price = None
         self.best_profit_percent = 0
         
@@ -116,7 +117,6 @@ class ShortAveragingStrategyCelery:
         
         # ✨ НОВОЕ: Отслеживание пиковой прибыли (важно!)
         self.peak_profit_percent = 0.0
-        self.peak_price = None
         
         # ✨ НОВОЕ: Редкие проверки (ТОЛЬКО для некритичных операций)
         self.last_position_check = 0
@@ -132,7 +132,31 @@ class ShortAveragingStrategyCelery:
         self.ticks_processed = 0
         self.start_time = None
         
+        # ✨ НОВОЕ: Флаг для отслеживания фиктивного TP
+        self.fake_tp_reached = False
+        
         logger.info(f"[{self.symbol}] Стратегия инициализирована в БЫСТРОМ режиме")
+
+    def _ensure_event_loop(self):
+        """Создает event loop если его нет"""
+        if not self.loop:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+
+    async def safe_send_notification(self, notification_func, *args, **kwargs):
+        """Безопасная отправка уведомления с проверкой event loop"""
+        try:
+            # ✨ ИСПРАВЛЕНИЕ: Проверяем и создаем event loop если нужно
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                # Если нет активного loop, создаем новый
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
+            await notification_func(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"[{self.symbol}] Ошибка отправки уведомления: {e}")
 
     def _load_symbol_info(self):
         """Загружает информацию о символе и правилах торговли"""
@@ -220,6 +244,28 @@ class ShortAveragingStrategyCelery:
             logger.error(f"[{self.symbol}] Ошибка проверки позиции: {e}")
             return False
 
+    def get_position_avg_price(self) -> Optional[float]:
+        """Получает среднюю цену входа позиции из API"""
+        try:
+            response = self.session.get_positions(
+                category="linear",
+                symbol=self.symbol
+            )
+            
+            if response.get('retCode') == 0:
+                positions = response.get('result', {}).get('list', [])
+                for pos in positions:
+                    size = float(pos.get('size', 0))
+                    if size > 0:
+                        avg_price = float(pos.get('avgPrice', 0))
+                        if avg_price > 0:
+                            logger.info(f"[{self.symbol}] Средняя цена входа из API: {avg_price:.8g}")
+                            return avg_price
+            return None
+        except Exception as e:
+            logger.error(f"[{self.symbol}] Ошибка получения средней цены: {e}")
+            return None
+
     async def open_short_position(self, current_price: float) -> bool:
         """Открывает шорт-позицию с повторными попытками"""
         if self.open_attempts >= self.max_open_attempts:
@@ -232,14 +278,12 @@ class ShortAveragingStrategyCelery:
                 logger.error(f"[{self.symbol}] {error_msg}")
                 
                 # Уведомляем об ошибке
-                try:
-                    chat_ids = await get_all_subscribed_users()
-                    await notify_strategy_error(
-                        chat_ids, TELEGRAM_BOT_TOKEN, self.symbol, 
-                        error_msg, "SHORT_AVERAGING"
-                    )
-                except Exception as e:
-                    logger.error(f"[{self.symbol}] Ошибка отправки уведомления: {e}")
+                chat_ids = await get_all_subscribed_users()
+                await self.safe_send_notification(
+                    notify_strategy_error,
+                    chat_ids, TELEGRAM_BOT_TOKEN, self.symbol, 
+                    error_msg, "SHORT_AVERAGING"
+                )
             return False
         
         try:
@@ -262,6 +306,7 @@ class ShortAveragingStrategyCelery:
             
             if order.get('retCode') == 0:
                 self.entry_price = current_price
+                self.initial_entry_price = current_price  # Сохраняем изначальную цену
                 self.position_qty = qty
                 self.position_opened = True
                 
@@ -273,15 +318,13 @@ class ShortAveragingStrategyCelery:
                 logger.info(f"🎯 Тейк-профит: {self.tp_price:.8g} (-{self.initial_tp_percent}%)")
                 
                 # Отправляем уведомление об открытии позиции
-                try:
-                    chat_ids = await get_all_subscribed_users()
-                    await notify_position_opened(
-                        chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
-                        self.entry_price, self.position_qty, self.usdt_amount,
-                        self.tp_price, self.initial_tp_percent, "SHORT"
-                    )
-                except Exception as e:
-                    logger.error(f"[{self.symbol}] Ошибка отправки уведомления: {e}")
+                chat_ids = await get_all_subscribed_users()
+                await self.safe_send_notification(
+                    notify_position_opened,
+                    chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
+                    self.entry_price, self.position_qty, self.usdt_amount,
+                    self.tp_price, self.initial_tp_percent, "SHORT"
+                )
                 
                 # Выставляем лимитный ордер на усреднение
                 await self.place_averaging_order()
@@ -305,15 +348,16 @@ class ShortAveragingStrategyCelery:
             return False
 
     async def place_averaging_order(self) -> bool:
-        """Выставляет лимитный ордер на усреднение"""
+        """Выставляет лимитный ордер на усреднение +10% от цены входа"""
         try:
-            # Для шорта усреднение происходит ВЫШЕ (+10%)
+            # ✨ ИСПРАВЛЕНИЕ: Усреднение +10% от цены входа (для шорта это ВЫШЕ)
             averaging_price = self.entry_price * (1 + self.averaging_percent / 100)
-            qty = self.calculate_qty(averaging_price)
+            qty = self.calculate_qty(averaging_price)  # Сумма в USDT по новой цене
             
             logger.info("📝 Выставляем лимитный ордер на усреднение...")
-            logger.info(f"💰 Цена усреднения: {averaging_price:.8g} (+{self.averaging_percent}%)")
-            logger.info(f"📈 Количество: {qty} (округлено до {self.qty_precision} знаков)")
+            logger.info(f"💰 Цена усреднения: {averaging_price:.8g} (+{self.averaging_percent}% от входа)")
+            logger.info(f"📈 Количество: {qty} (сумма: {self.usdt_amount} USDT)")
+            logger.info(f"📊 Округлено до {self.qty_precision} знаков")
             
             order = self.session.place_order(
                 category="linear",
@@ -329,14 +373,12 @@ class ShortAveragingStrategyCelery:
                 logger.info(f"✅ Лимитный ордер выставлен! ID: {self.averaging_order_id}")
                 
                 # Отправляем уведомление
-                try:
-                    chat_ids = await get_all_subscribed_users()
-                    await notify_averaging_order_placed(
-                        chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
-                        averaging_price, self.averaging_percent, qty
-                    )
-                except Exception as e:
-                    logger.error(f"[{self.symbol}] Ошибка отправки уведомления: {e}")
+                chat_ids = await get_all_subscribed_users()
+                await self.safe_send_notification(
+                    notify_averaging_order_placed,
+                    chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
+                    averaging_price, self.averaging_percent, qty
+                )
                 
                 return True
             else:
@@ -389,42 +431,62 @@ class ShortAveragingStrategyCelery:
         try:
             logger.info(f"[{self.symbol}] Усреднение сработало!")
             
-            # Рассчитываем усредненную цену
-            averaging_price = self.entry_price * (1 + self.averaging_percent / 100)
-            new_qty = self.calculate_qty(averaging_price)
+            # ✨ ИСПРАВЛЕНИЕ: Получаем среднюю цену входа из API
+            api_avg_price = self.get_position_avg_price()
+            if api_avg_price:
+                self.averaged_price = api_avg_price
+                logger.info(f"[{self.symbol}] Средняя цена входа из API: {self.averaged_price:.8g}")
+            else:
+                # Fallback: рассчитываем вручную (если API не работает)
+                averaging_price = self.entry_price * (1 + self.averaging_percent / 100)  # +10% от входа
+                new_qty = self.calculate_qty(averaging_price)
+                total_qty = self.position_qty + new_qty
+                self.averaged_price = (
+                    self.entry_price * self.position_qty + averaging_price * new_qty
+                ) / total_qty
+                logger.warning(f"[{self.symbol}] Используем расчетную среднюю цену: {self.averaged_price:.8g}")
             
-            total_qty = self.position_qty + new_qty
-            self.averaged_price = (
-                self.entry_price * self.position_qty + averaging_price * new_qty
-            ) / total_qty
-            self.position_qty = total_qty
+            # Получаем обновленное количество из API
+            try:
+                response = self.session.get_positions(category="linear", symbol=self.symbol)
+                if response.get('retCode') == 0:
+                    positions = response.get('result', {}).get('list', [])
+                    for pos in positions:
+                        size = float(pos.get('size', 0))
+                        if size > 0:
+                            self.position_qty = size
+                            break
+            except Exception as e:
+                logger.warning(f"[{self.symbol}] Не удалось получить обновленное количество: {e}")
+            
             self.is_averaged = True
             
-            # Устанавливаем стоп-лосс (для шорта это ВЫШЕ усредненной цены)
+            # ✨ ИСПРАВЛЕНИЕ: Устанавливаем стоп-лосс относительно новой средней цены
             self.stop_loss_price = self.averaged_price * (1 + self.stop_loss_percent / 100)
             
-            # Новый тейк-профит от усредненной цены
+            # ✨ ИСПРАВЛЕНИЕ: Новый тейк-профит от усредненной цены
             self.tp_price = self.averaged_price * (1 - self.initial_tp_percent / 100)
+            # ✨ НОВОЕ: 2% фиктивный TP от усредненной цены
+            self.fake_tp_price = self.averaged_price * (1 - 0.02)  # 2% от усредненной цены
             self.best_profit_percent = 0
+            # ✨ ВАЖНО: Сбрасываем безубыток, чтобы он пересчитался от усредненной цены
             self.breakeven_price = None
             
             logger.info(
                 f"[{self.symbol}] Усредненная цена: {self.averaged_price:.6f}, "
                 f"SL: {self.stop_loss_price:.6f}, TP: {self.tp_price:.6f}, "
-                f"Qty: {self.position_qty}"
+                f"Fake TP: {self.fake_tp_price:.6f}, Qty: {self.position_qty}"
             )
             
             # Отправляем уведомление
-            try:
-                chat_ids = await get_all_subscribed_users()
-                await notify_averaging_executed(
-                    chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
-                    self.averaged_price, self.position_qty,
-                    self.tp_price, self.initial_tp_percent,
-                    self.stop_loss_price, self.stop_loss_percent
-                )
-            except Exception as e:
-                logger.error(f"[{self.symbol}] Ошибка отправки уведомления: {e}")
+            chat_ids = await get_all_subscribed_users()
+            await self.safe_send_notification(
+                notify_averaging_executed,
+                chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
+                self.averaged_price, self.position_qty,
+                self.tp_price, self.initial_tp_percent,
+                self.stop_loss_price, self.stop_loss_percent
+            )
             
             return True
             
@@ -445,8 +507,22 @@ class ShortAveragingStrategyCelery:
                 return "STOP"
             self.last_position_check = current_time
         
-        # Определяем базовую цену для расчетов
-        base_price = self.averaged_price if self.is_averaged else self.entry_price
+        # ✨ ИСПРАВЛЕНИЕ: Определяем базовую цену для расчетов
+        # Если усреднение произошло, используем среднюю цену из API
+        if self.is_averaged:
+            # Периодически обновляем среднюю цену из API
+            if current_time - self.last_position_check > self.position_check_interval:
+                api_avg_price = self.get_position_avg_price()
+                if api_avg_price:
+                    self.averaged_price = api_avg_price
+            base_price = self.averaged_price
+        else:
+            base_price = self.entry_price
+        
+        # ✨ НОВОЕ: Определяем цену для расчетов TP и БУ
+        # ДО усреднения: от начальной цены входа
+        # ПОСЛЕ усреднения: от усредненной цены
+        tp_breakeven_base_price = self.averaged_price if self.is_averaged else self.entry_price
         
         # ✨ КРИТИЧНО: Рассчитываем прибыль на КАЖДОМ тике
         profit_percent = (base_price - current_price) / base_price * 100
@@ -454,7 +530,6 @@ class ShortAveragingStrategyCelery:
         # ✨ НОВОЕ: Отслеживаем пиковую прибыль
         if profit_percent > self.peak_profit_percent:
             self.peak_profit_percent = profit_percent
-            self.peak_price = current_price
         
         # ✅ КРИТИЧНО: Проверяем стоп-лосс НА КАЖДОМ ТИКЕ (без кэширования!)
         if self.is_averaged and self.stop_loss_price:
@@ -465,14 +540,12 @@ class ShortAveragingStrategyCelery:
                 )
                 
                 # Уведомление - НЕ блокируем, отправляем асинхронно
-                try:
-                    chat_ids = await get_all_subscribed_users()
-                    await notify_stop_loss_triggered(
-                        chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
-                        current_price, self.stop_loss_price
-                    )
-                except Exception as e:
-                    logger.error(f"[{self.symbol}] Ошибка уведомления: {e}")
+                chat_ids = await get_all_subscribed_users()
+                await self.safe_send_notification(
+                    notify_stop_loss_triggered,
+                    chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
+                    current_price, self.stop_loss_price
+                )
                 
                 return "CLOSE"
         
@@ -483,49 +556,58 @@ class ShortAveragingStrategyCelery:
                     await self.apply_averaging(current_price)
                 self.last_averaging_check = current_time
         
+        # ✨ НОВОЕ: Проверяем 2% фиктивный TP после усреднения
+        if self.is_averaged and self.fake_tp_price and current_price <= self.fake_tp_price:
+            # Проверяем, что это первый раз когда достигаем фиктивный TP
+            if not hasattr(self, 'fake_tp_reached') or not self.fake_tp_reached:
+                self.fake_tp_reached = True
+                logger.info(
+                    f"[{self.symbol}] 🎯 Достигнут 2% фиктивный TP! "
+                    f"Цена: {current_price:.6f} <= {self.fake_tp_price:.6f}"
+                )
+                # Фиктивный TP не закрывает позицию, только логируем
+        
         # ✅ КРИТИЧНО: Логика тейк-профита - ПРОВЕРЯЕМ КАЖДЫЙ ТИК!
         if profit_percent >= self.initial_tp_percent:
             if not self.breakeven_price:
-                # Первый раз достигли TP
-                self.breakeven_price = base_price * (1 - self.initial_tp_percent / 100)
+                # Первый раз достигли TP - ставим БУ на текущий уровень прибыли
+                self.breakeven_price = current_price
                 self.best_profit_percent = profit_percent
                 logger.info(
                     f"[{self.symbol}] 🎯 Достигнут TP {self.initial_tp_percent}%! "
-                    f"Безубыток: {self.breakeven_price:.6f}"
+                    f"Безубыток установлен на: {self.breakeven_price:.6f} ({profit_percent:.1f}%)"
                 )
                 
                 # Уведомление асинхронно
-                try:
-                    chat_ids = await get_all_subscribed_users()
-                    await notify_take_profit_reached(
-                        chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
-                        current_price, profit_percent, self.breakeven_price
-                    )
-                except Exception as e:
-                    logger.error(f"[{self.symbol}] Ошибка уведомления: {e}")
+                chat_ids = await get_all_subscribed_users()
+                await self.safe_send_notification(
+                    notify_take_profit_reached,
+                    chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
+                    current_price, profit_percent, self.breakeven_price
+                )
             else:
-                # Проверяем шаги безубытка
-                steps_passed = int((profit_percent - self.initial_tp_percent) / self.breakeven_step)
-                target_breakeven_percent = self.initial_tp_percent + steps_passed * self.breakeven_step
-                new_breakeven = base_price * (1 - target_breakeven_percent / 100)
+                # Проверяем шаги безубытка - каждые 2% прибыли
+                # При 3% прибыли: БУ = 3%
+                # При 5% прибыли: БУ = 5% 
+                # При 7% прибыли: БУ = 7%
+                target_breakeven_percent = int(profit_percent / self.breakeven_step) * self.breakeven_step
                 
-                if new_breakeven < self.breakeven_price:
+                # Если прибыль достигла нового уровня (например, 5% или 7%)
+                if target_breakeven_percent > self.best_profit_percent:
                     old_breakeven = self.breakeven_price
-                    self.breakeven_price = new_breakeven
-                    self.best_profit_percent = profit_percent
+                    self.breakeven_price = current_price
+                    self.best_profit_percent = target_breakeven_percent
                     logger.info(
                         f"[{self.symbol}] 🔒 Безубыток перемещен: {old_breakeven:.6f} -> "
                         f"{self.breakeven_price:.6f} ({target_breakeven_percent:.1f}%)"
                     )
                     
-                    try:
-                        chat_ids = await get_all_subscribed_users()
-                        await notify_breakeven_moved(
-                            chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
-                            self.breakeven_price, target_breakeven_percent, profit_percent
-                        )
-                    except Exception as e:
-                        logger.error(f"[{self.symbol}] Ошибка уведомления: {e}")
+                    chat_ids = await get_all_subscribed_users()
+                    await self.safe_send_notification(
+                        notify_breakeven_moved,
+                        chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
+                        self.breakeven_price, target_breakeven_percent, profit_percent
+                    )
         
         # ✅ КРИТИЧНО: Проверяем безубыток НА КАЖДОМ ТИКЕ!
         if self.breakeven_price and current_price >= self.breakeven_price:
@@ -620,8 +702,12 @@ class ShortAveragingStrategyCelery:
             if order.get('retCode') == 0:
                 logger.info(f"[{self.symbol}] Позиция успешно закрыта!")
                 
-                # Рассчитываем прибыль/убыток
-                base_price = self.averaged_price if self.is_averaged else self.entry_price
+                # ✨ ИСПРАВЛЕНИЕ: Рассчитываем прибыль/убыток относительно правильной базовой цены
+                if self.is_averaged and self.averaged_price:
+                    base_price = self.averaged_price
+                else:
+                    base_price = self.entry_price
+                
                 profit_percent = None
                 profit_usdt = None
                 
@@ -636,16 +722,14 @@ class ShortAveragingStrategyCelery:
                         close_reason = "STOP_LOSS"
                 
                 # Отправляем уведомление о закрытии
-                try:
-                    chat_ids = await get_all_subscribed_users()
-                    await notify_position_closed(
-                        chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
-                        close_reason, base_price, current_price or 0,
-                        self.position_qty, profit_percent, profit_usdt,
-                        self.is_averaged
-                    )
-                except Exception as e:
-                    logger.error(f"[{self.symbol}] Ошибка отправки уведомления: {e}")
+                chat_ids = await get_all_subscribed_users()
+                await self.safe_send_notification(
+                    notify_position_closed,
+                    chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
+                    close_reason, base_price, current_price or 0,
+                    self.position_qty, profit_percent, profit_usdt,
+                    self.is_averaged
+                )
                 
                 return True
             else:
@@ -685,10 +769,7 @@ class ShortAveragingStrategyCelery:
             
             # Автоматическое открытие позиции
             if not self.position_opened and not self.failed_to_open:
-                if not self.loop:
-                    self.loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(self.loop)
-                
+                self._ensure_event_loop()
                 success = self.loop.run_until_complete(self.open_short_position(current_price))
                 
                 if success:
@@ -701,15 +782,17 @@ class ShortAveragingStrategyCelery:
             
             # ✨ Если позиция открыта, делаем БЫСТРЫЕ локальные расчеты
             if self.position_opened:
-                base_price = self.averaged_price if self.is_averaged else self.entry_price
+                # ✨ ИСПРАВЛЕНИЕ: Используем правильную базовую цену
+                if self.is_averaged and self.averaged_price:
+                    base_price = self.averaged_price
+                else:
+                    base_price = self.entry_price
                 profit_percent = (base_price - current_price) / base_price * 100
                 
                 # ✨ КРИТИЧНО: Мгновенная проверка безубытка ПЕРЕД всем остальным!
                 if self.breakeven_price and current_price >= self.breakeven_price:
                     logger.warning(f"🚨 МГНОВЕННОЕ срабатывание безубытка на {profit_percent:.2f}%!")
-                    if not self.loop:
-                        self.loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(self.loop)
+                    self._ensure_event_loop()
                     self.loop.run_until_complete(self.close_position())
                     self.should_stop = True
                     self.stop_websocket()
@@ -740,9 +823,7 @@ class ShortAveragingStrategyCelery:
                     )
             
             # Создаем loop если нужно
-            if not self.loop:
-                self.loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(self.loop)
+            self._ensure_event_loop()
             
             # ✅ Основная логика update - проверяет ВСЕ на каждом тике
             action = self.loop.run_until_complete(self.update(current_price, current_time))
@@ -772,7 +853,7 @@ class ShortAveragingStrategyCelery:
             logger.info(f"📊 Символ: {self.symbol}")
             logger.info(f"💰 Сумма: {self.usdt_amount} USDT")
             logger.info(f"📏 Точность: {self.qty_precision} знаков (мин: {self.min_qty})")
-            logger.info(f"📈 Усреднение: {self.averaging_percent}%")
+            logger.info(f"📈 Усреднение: +{self.averaging_percent}% от цены входа (сумма: {self.usdt_amount} USDT)")
             logger.info(f"🎯 Тейк-профит: {self.initial_tp_percent}%")
             logger.info(f"🔒 Безубыток шаг: {self.breakeven_step}%")
             logger.info(f"🛡️ Стоп-лосс: {self.stop_loss_percent}%")
@@ -780,8 +861,7 @@ class ShortAveragingStrategyCelery:
             logger.info("=" * 60)
             
             # ✨ Создаем ОДИН event loop для всей стратегии
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
+            self._ensure_event_loop()
             
             # Инициализируем WebSocket
             self.ws = WebSocket(testnet=False, channel_type="linear")
@@ -801,14 +881,12 @@ class ShortAveragingStrategyCelery:
         except Exception as e:
             logger.error(f"[{self.symbol}] Критическая ошибка: {e}", exc_info=True)
             
-            try:
-                chat_ids = await get_all_subscribed_users()
-                await notify_strategy_error(
-                    chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
-                    str(e), "SHORT_AVERAGING"
-                )
-            except Exception as notify_error:
-                logger.error(f"Ошибка уведомления: {notify_error}")
+            chat_ids = await get_all_subscribed_users()
+            await self.safe_send_notification(
+                notify_strategy_error,
+                chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
+                str(e), "SHORT_AVERAGING"
+            )
             
             raise
         

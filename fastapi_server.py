@@ -12,6 +12,7 @@ from celery_app.tasks.bybit_tasks import (
 from utils.send_tg_message import send_message_to_telegram
 from utils.signal_parser import process_signal, clean_symbol
 from database import get_all_subscribed_users
+from bybit.stop_all_orders import stop_all_trading, stop_trading_by_symbol
 from config import TELEGRAM_BOT_TOKEN, NGROK_TOKEN
 import asyncio
 import re
@@ -19,6 +20,10 @@ from logger_config import setup_logger
 
 # Настройка logger
 logger = setup_logger(__name__)
+
+# Настройка логгера для FastAPI
+import logging
+fastapi_logger = setup_logger("fastapi_server")
 
 # Проверяем конфигурацию
 if not TELEGRAM_BOT_TOKEN:
@@ -131,8 +136,11 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
         signal_text = signal_text.strip().strip("'\"")
     
     logger.info(f"[WEBHOOK] Получен вебхук: {data}")
+    fastapi_logger.info(f"[WEBHOOK] Получен вебхук с данными: {data}")
+    
     if not signal_text:
         logger.error("[WEBHOOK] Ошибка: не найден сигнал в payload (ожидался 'text' или 'ticker')")
+        fastapi_logger.error("[WEBHOOK] Ошибка: не найден сигнал в payload")
         return {"error": "No signal in payload (expected 'text' or 'ticker')"}
     
     # Парсим сигнал для определения типа стратегии
@@ -145,6 +153,8 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
     # Запускаем стратегию на основе парсинга сигнала
     result = run_strategy_by_signal.delay(signal_text)
     logger.info(f"[WEBHOOK] Задача на запуск стратегии {strategy_function} для {symbol} отправлена в Celery")
+    fastapi_logger.info(f"[WEBHOOK] Запущена стратегия {strategy_function} для {symbol}, task_id: {result.id}")
+    
     return {
         "status": "started", 
         "symbol": symbol, 
@@ -286,6 +296,10 @@ async def short_averaging(request: Request):
         f"USDT={usdt_amount}, Avg={averaging_percent}%, TP={initial_tp_percent}%, "
         f"BE={breakeven_step}%, SL={stop_loss_percent}%"
     )
+    fastapi_logger.info(
+        f"[SHORT_AVERAGING] Запрос на запуск стратегии усреднения для {symbol} "
+        f"(USDT: {usdt_amount}, Demo: {use_demo})"
+    )
     
     result = run_short_averaging_strategy_task.delay(
         symbol=symbol,
@@ -351,6 +365,71 @@ async def get_positions():
     logger.info("[ACTIVE_POSITIONS] Запрос на получение активных позиций отправлен в Celery")
     return {"status": "requested", "task_id": result.id}
 
+@app.post("/stop_all_trading")
+async def stop_all_trading_endpoint():
+    """Останавливает всю торговлю - отменяет все ордера и закрывает все позиции"""
+    try:
+        logger.info("[STOP_ALL_TRADING] Запрос на остановку всей торговли")
+        fastapi_logger.info("[STOP_ALL_TRADING] Получен запрос на остановку всей торговли")
+        
+        # Выполняем остановку торговли
+        stop_all_trading()
+        
+        # Отправляем уведомление в Telegram
+        try:
+            users = await get_all_subscribed_users()
+            message = "🛑 ВСЯ ТОРГОВЛЯ ОСТАНОВЛЕНА!\n\nВсе ордера отменены и позиции закрыты."
+            
+            for user in users:
+                await send_message_to_telegram(user['telegram_id'], message)
+                logger.info(f"[STOP_ALL_TRADING] Уведомление отправлено пользователю {user['telegram_id']}")
+        except Exception as e:
+            logger.error(f"[STOP_ALL_TRADING] Ошибка при отправке уведомлений: {e}")
+        
+        logger.info("[STOP_ALL_TRADING] Остановка всей торговли завершена успешно")
+        return {"status": "success", "message": "Вся торговля остановлена"}
+        
+    except Exception as e:
+        logger.error(f"[STOP_ALL_TRADING] Ошибка при остановке торговли: {e}")
+        return {"status": "error", "message": f"Ошибка при остановке торговли: {str(e)}"}
+
+@app.post("/stop_trading_by_symbol")
+async def stop_trading_by_symbol_endpoint(request: Request):
+    """Останавливает торговлю для определенной монеты"""
+    try:
+        payload = await request.json()
+        symbol = payload.get('symbol') or payload.get('ticker')
+        
+        if not symbol:
+            logger.warning("[STOP_TRADING_BY_SYMBOL] Не указан символ в запросе")
+            return {"error": "No symbol in payload (expected 'symbol' or 'ticker')"}
+        
+        # Очищаем символ
+        cleaned_symbol = clean_symbol(symbol)
+        logger.info(f"[STOP_TRADING_BY_SYMBOL] Запрос на остановку торговли для {cleaned_symbol}")
+        fastapi_logger.info(f"[STOP_TRADING_BY_SYMBOL] Получен запрос на остановку торговли для {cleaned_symbol}")
+        
+        # Выполняем остановку торговли для символа
+        stop_trading_by_symbol(cleaned_symbol)
+        
+        # Отправляем уведомление в Telegram
+        try:
+            users = await get_all_subscribed_users()
+            message = f"🛑 ТОРГОВЛЯ ОСТАНОВЛЕНА ДЛЯ {cleaned_symbol}!\n\nВсе ордера отменены и позиция закрыта."
+            
+            for user in users:
+                await send_message_to_telegram(user['telegram_id'], message)
+                logger.info(f"[STOP_TRADING_BY_SYMBOL] Уведомление отправлено пользователю {user['telegram_id']}")
+        except Exception as e:
+            logger.error(f"[STOP_TRADING_BY_SYMBOL] Ошибка при отправке уведомлений: {e}")
+        
+        logger.info(f"[STOP_TRADING_BY_SYMBOL] Остановка торговли для {cleaned_symbol} завершена успешно")
+        return {"status": "success", "message": f"Торговля для {cleaned_symbol} остановлена", "symbol": cleaned_symbol}
+        
+    except Exception as e:
+        logger.error(f"[STOP_TRADING_BY_SYMBOL] Ошибка при остановке торговли: {e}")
+        return {"status": "error", "message": f"Ошибка при остановке торговли: {str(e)}"}
+
 @app.get("/health")
 def health():
     logger.info("[HEALTH] Проверка работоспособности сервера FastAPI")
@@ -358,5 +437,23 @@ def health():
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("[START] Запуск FastAPI сервера через uvicorn на 0.0.0.0:8000")
-    uvicorn.run("fastapi_server:app", host="0.0.0.0", port=9000, reload=False)
+    import logging
+    
+    # Настройка логгера для uvicorn
+    uvicorn_logger = setup_logger("uvicorn")
+    
+    # Настройка уровня логирования для uvicorn
+    logging.getLogger("uvicorn").setLevel(logging.INFO)
+    logging.getLogger("uvicorn.access").setLevel(logging.INFO)
+    
+    logger.info("[START] Запуск FastAPI сервера через uvicorn на 0.0.0.0:9000")
+    fastapi_logger.info("[FASTAPI] Сервер запускается...")
+    
+    uvicorn.run(
+        "fastapi_server:app", 
+        host="0.0.0.0", 
+        port=9000, 
+        reload=False,
+        log_level="info",
+        access_log=True
+    )
