@@ -3,3 +3,5 @@ celery
 requests
 fastapi
 pybit
+redis
+pymongo

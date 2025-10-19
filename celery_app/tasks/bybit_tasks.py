@@ -220,6 +220,37 @@ def run_short_averaging_strategy_task(
         f"TP={initial_tp_percent}%, BE Step={breakeven_step}%, SL={stop_loss_percent}%"
     )
     
+    # ✨ КРИТИЧНО: Проверяем активные задачи для этого символа
+    try:
+        from celery_app import celery_app
+        
+        # Получаем список активных задач
+        inspect = celery_app.control.inspect()
+        active_tasks = inspect.active()
+        
+        if active_tasks:
+            for worker, tasks in active_tasks.items():
+                for task in tasks:
+                    task_name = task.get('name', '')
+                    task_args = task.get('args', [])
+                    
+                    # Проверяем, есть ли уже активная задача для этого символа
+                    if ('run_short_averaging_strategy' in task_name and 
+                        len(task_args) > 0 and 
+                        task_args[0] == clean_symbol and
+                        task.get('id') != self.request.id):  # Исключаем текущую задачу
+                        
+                        logger.warning(f"[Bybit] ⚠️ Обнаружена активная задача для {clean_symbol}! Игнорируем дублирующий сигнал.")
+                        return {
+                            'status': 'ignored', 
+                            'symbol': clean_symbol, 
+                            'reason': 'Active task already running for this symbol'
+                        }
+                        
+    except Exception as e:
+        logger.warning(f"[Bybit] Не удалось проверить активные задачи: {e}")
+        # Продолжаем выполнение, так как это не критично
+    
     try:
         loop = get_or_create_event_loop()
         logger.info(f"[Bybit] Используем event loop для {clean_symbol}: {loop}")

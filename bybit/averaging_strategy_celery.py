@@ -6,7 +6,7 @@ from pybit.unified_trading import WebSocket, HTTP
 import asyncio
 from typing import Optional
 from config import API_KEY, API_SECRET, DEMO_API_KEY, DEMO_API_SECRET, TELEGRAM_BOT_TOKEN
-from database import get_all_subscribed_users
+from database import get_all_subscribed_users, get_cached_subscribers
 from utils.send_tg_message import (
     notify_position_opened,
     notify_averaging_order_placed,
@@ -145,19 +145,80 @@ class ShortAveragingStrategyCelery:
             asyncio.set_event_loop(self.loop)
 
     async def safe_send_notification(self, notification_func, *args, **kwargs):
-        """Безопасная отправка уведомления с проверкой event loop"""
+        """Безопасная отправка уведомления с использованием кэшированных подписчиков"""
         try:
+            # ✨ ИСПРАВЛЕНИЕ: Используем кэшированных подписчиков вместо асинхронной БД
+            # Получаем подписчиков из кэша (синхронно, не зависит от event loop)
+            chat_ids = get_cached_subscribers()
+            
+            if not chat_ids:
+                logger.warning(f"[{self.symbol}] Нет подписчиков для отправки уведомления")
+                return
+            
+            logger.debug(f"[{self.symbol}] Отправляем уведомление {len(chat_ids)} подписчикам")
+            
             # ✨ ИСПРАВЛЕНИЕ: Проверяем и создаем event loop если нужно
             try:
                 loop = asyncio.get_running_loop()
+                if loop.is_closed():
+                    raise RuntimeError("Event loop is closed")
             except RuntimeError:
-                # Если нет активного loop, создаем новый
+                # Если нет активного loop или он закрыт, создаем новый
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
             
-            await notification_func(*args, **kwargs)
+            # Заменяем первый аргумент (chat_ids) на кэшированных подписчиков
+            if args and len(args) > 0:
+                # Заменяем первый аргумент (chat_ids) на кэшированных
+                new_args = (chat_ids,) + args[1:]
+                await notification_func(*new_args, **kwargs)
+            else:
+                # Если нет аргументов, добавляем chat_ids
+                await notification_func(chat_ids, **kwargs)
+                
         except Exception as e:
             logger.error(f"[{self.symbol}] Ошибка отправки уведомления: {e}")
+            # Fallback: пытаемся отправить через синхронную функцию
+            try:
+                self._send_notification_fallback(notification_func, *args, **kwargs)
+            except Exception as fallback_error:
+                logger.error(f"[{self.symbol}] Fallback отправка также не удалась: {fallback_error}")
+    
+    def _send_notification_fallback(self, notification_func, *args, **kwargs):
+        """Fallback метод для отправки уведомлений через отдельный поток"""
+        import threading
+        import asyncio
+        
+        def run_in_thread():
+            try:
+                # Создаем новый event loop в отдельном потоке
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                # Получаем подписчиков синхронно
+                chat_ids = get_cached_subscribers()
+                if not chat_ids:
+                    return
+                
+                # Заменяем chat_ids в аргументах
+                if args and len(args) > 0:
+                    new_args = (chat_ids,) + args[1:]
+                    loop.run_until_complete(notification_func(*new_args, **kwargs))
+                else:
+                    loop.run_until_complete(notification_func(chat_ids, **kwargs))
+                    
+            except Exception as e:
+                logger.error(f"[{self.symbol}] Ошибка в fallback потоке: {e}")
+            finally:
+                try:
+                    loop.close()
+                except:
+                    pass
+        
+        # Запускаем в отдельном потоке с timeout
+        thread = threading.Thread(target=run_in_thread)
+        thread.start()
+        thread.join(timeout=10)  # Ждем максимум 10 секунд
 
     def _load_symbol_info(self):
         """Загружает информацию о символе и правилах торговли"""
@@ -245,6 +306,39 @@ class ShortAveragingStrategyCelery:
             logger.error(f"[{self.symbol}] Ошибка проверки позиции: {e}")
             return False
 
+    def check_open_orders_exist(self) -> bool:
+        """Проверяет существование открытых ордеров на бирже"""
+        try:
+            response = self.session.get_open_orders(
+                category="linear",
+                symbol=self.symbol
+            )
+            
+            if response.get('retCode') == 0:
+                orders = response.get('result', {}).get('list', [])
+                if len(orders) > 0:
+                    logger.info(f"[{self.symbol}] Найдено {len(orders)} открытых ордеров")
+                    return True
+            return False
+        except Exception as e:
+            logger.error(f"[{self.symbol}] Ошибка проверки ордеров: {e}")
+            return False
+
+    def check_active_trading(self) -> bool:
+        """Проверяет наличие активной торговли (позиций или ордеров)"""
+        has_position = self.check_position_exists()
+        has_orders = self.check_open_orders_exist()
+        
+        if has_position:
+            logger.warning(f"[{self.symbol}] ⚠️ Обнаружена открытая позиция! Торговля уже активна.")
+            return True
+            
+        if has_orders:
+            logger.warning(f"[{self.symbol}] ⚠️ Обнаружены открытые ордера! Торговля уже активна.")
+            return True
+            
+        return False
+
     def get_position_avg_price(self) -> Optional[float]:
         """Получает среднюю цену входа позиции из API"""
         try:
@@ -279,10 +373,9 @@ class ShortAveragingStrategyCelery:
                 logger.error(f"[{self.symbol}] {error_msg}")
                 
                 # Уведомляем об ошибке
-                chat_ids = await get_all_subscribed_users()
                 await self.safe_send_notification(
                     notify_strategy_error,
-                    chat_ids, TELEGRAM_BOT_TOKEN, self.symbol, 
+                    TELEGRAM_BOT_TOKEN, self.symbol, 
                     error_msg, "SHORT_AVERAGING"
                 )
             return False
@@ -319,10 +412,9 @@ class ShortAveragingStrategyCelery:
                 logger.info(f"🎯 Тейк-профит: {self.tp_price:.8g} (-{self.initial_tp_percent}%)")
                 
                 # Отправляем уведомление об открытии позиции
-                chat_ids = await get_all_subscribed_users()
                 await self.safe_send_notification(
                     notify_position_opened,
-                    chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
+                    TELEGRAM_BOT_TOKEN, self.symbol,
                     self.entry_price, self.position_qty, self.usdt_amount,
                     self.tp_price, self.initial_tp_percent, "SHORT"
                 )
@@ -374,10 +466,9 @@ class ShortAveragingStrategyCelery:
                 logger.info(f"✅ Лимитный ордер выставлен! ID: {self.averaging_order_id}")
                 
                 # Отправляем уведомление
-                chat_ids = await get_all_subscribed_users()
                 await self.safe_send_notification(
                     notify_averaging_order_placed,
-                    chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
+                    TELEGRAM_BOT_TOKEN, self.symbol,
                     averaging_price, self.averaging_percent, qty
                 )
                 
@@ -480,10 +571,9 @@ class ShortAveragingStrategyCelery:
             )
             
             # Отправляем уведомление
-            chat_ids = await get_all_subscribed_users()
             await self.safe_send_notification(
                 notify_averaging_executed,
-                chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
+                TELEGRAM_BOT_TOKEN, self.symbol,
                 self.averaged_price, self.position_qty,
                 self.tp_price, self.initial_tp_percent,
                 self.stop_loss_price, self.stop_loss_percent
@@ -541,10 +631,9 @@ class ShortAveragingStrategyCelery:
                 )
                 
                 # Уведомление - НЕ блокируем, отправляем асинхронно
-                chat_ids = await get_all_subscribed_users()
                 await self.safe_send_notification(
                     notify_stop_loss_triggered,
-                    chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
+                    TELEGRAM_BOT_TOKEN, self.symbol,
                     current_price, self.stop_loss_price
                 )
                 
@@ -580,10 +669,9 @@ class ShortAveragingStrategyCelery:
                 )
                 
                 # Уведомление асинхронно
-                chat_ids = await get_all_subscribed_users()
                 await self.safe_send_notification(
                     notify_take_profit_reached,
-                    chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
+                    TELEGRAM_BOT_TOKEN, self.symbol,
                     current_price, profit_percent, self.breakeven_price
                 )
             else:
@@ -603,10 +691,9 @@ class ShortAveragingStrategyCelery:
                         f"{self.breakeven_price:.6f} ({target_breakeven_percent:.1f}%)"
                     )
                     
-                    chat_ids = await get_all_subscribed_users()
                     await self.safe_send_notification(
                         notify_breakeven_moved,
-                        chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
+                        TELEGRAM_BOT_TOKEN, self.symbol,
                         self.breakeven_price, target_breakeven_percent, profit_percent
                     )
         
@@ -713,10 +800,9 @@ class ShortAveragingStrategyCelery:
                     close_reason = "STOP_LOSS"
             
             # Отправляем уведомление о закрытии
-            chat_ids = await get_all_subscribed_users()
             await self.safe_send_notification(
                 notify_position_closed,
-                chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
+                TELEGRAM_BOT_TOKEN, self.symbol,
                 close_reason, base_price, current_price or 0,
                 self.position_qty, profit_percent, profit_usdt,
                 self.is_averaged
@@ -847,6 +933,24 @@ class ShortAveragingStrategyCelery:
             logger.info(f"⚡ Режим: ПРОВЕРКА КАЖДОГО ТИКА")
             logger.info("=" * 60)
             
+            # ✨ КРИТИЧНО: Проверяем активную торговлю перед запуском
+            logger.info(f"🔍 Проверяем активную торговлю для {self.symbol}...")
+            if self.check_active_trading():
+                logger.warning(f"🛑 Торговля для {self.symbol} уже активна! Игнорируем новый сигнал.")
+                
+                # Отправляем уведомление о том, что сигнал проигнорирован
+                await self.safe_send_notification(
+                    notify_strategy_error,
+                    TELEGRAM_BOT_TOKEN, self.symbol,
+                    f"Сигнал проигнорирован: торговля уже активна для {self.symbol}", 
+                    "DUPLICATE_PREVENTION"
+                )
+                
+                logger.info(f"✅ Сигнал для {self.symbol} успешно проигнорирован")
+                return  # Выходим из стратегии
+            
+            logger.info(f"✅ Торговля для {self.symbol} не активна, начинаем стратегию")
+            
             # ✨ Создаем ОДИН event loop для всей стратегии
             self._ensure_event_loop()
             
@@ -868,10 +972,9 @@ class ShortAveragingStrategyCelery:
         except Exception as e:
             logger.error(f"[{self.symbol}] Критическая ошибка: {e}", exc_info=True)
             
-            chat_ids = await get_all_subscribed_users()
             await self.safe_send_notification(
                 notify_strategy_error,
-                chat_ids, TELEGRAM_BOT_TOKEN, self.symbol,
+                TELEGRAM_BOT_TOKEN, self.symbol,
                 str(e), "SHORT_AVERAGING"
             )
             
