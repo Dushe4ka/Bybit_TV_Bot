@@ -14,11 +14,11 @@ DB_NAME = 'bybit_tv'
 COLLECTION_NAME = 'subscriptions'
 COMPLETED_COLLECTION_NAME = 'completed_transactions'
 
-# Redis настройки
-REDIS_HOST = 'localhost'
-REDIS_PORT = 6379
-REDIS_DB = 0
-REDIS_PASSWORD = None  # Если нужен пароль, укажите здесь
+# Redis настройки (синхронизируем с Celery)
+REDIS_HOST = '127.0.0.1'
+REDIS_PORT = 14572
+REDIS_DB = 10
+REDIS_PASSWORD = 'Ollama12357985'  # Пароль из celery_config.py
 
 # Асинхронный MongoDB клиент (Motor)
 client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)

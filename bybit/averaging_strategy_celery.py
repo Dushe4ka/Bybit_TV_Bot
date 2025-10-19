@@ -167,14 +167,14 @@ class ShortAveragingStrategyCelery:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
             
-            # Заменяем первый аргумент (chat_ids) на кэшированных подписчиков
+            # Правильно формируем аргументы: chat_ids, bot_token, остальные аргументы
             if args and len(args) > 0:
-                # Заменяем первый аргумент (chat_ids) на кэшированных
-                new_args = (chat_ids,) + args[1:]
+                # Первый аргумент должен быть bot_token, добавляем chat_ids в начало
+                new_args = (chat_ids, args[0]) + args[1:]
                 await notification_func(*new_args, **kwargs)
             else:
-                # Если нет аргументов, добавляем chat_ids
-                await notification_func(chat_ids, **kwargs)
+                # Если нет аргументов, добавляем chat_ids и bot_token
+                await notification_func(chat_ids, TELEGRAM_BOT_TOKEN, **kwargs)
                 
         except Exception as e:
             logger.error(f"[{self.symbol}] Ошибка отправки уведомления: {e}")
@@ -200,12 +200,14 @@ class ShortAveragingStrategyCelery:
                 if not chat_ids:
                     return
                 
-                # Заменяем chat_ids в аргументах
+                # Правильно формируем аргументы: chat_ids, bot_token, остальные аргументы
                 if args and len(args) > 0:
-                    new_args = (chat_ids,) + args[1:]
+                    # Первый аргумент должен быть bot_token, добавляем chat_ids в начало
+                    new_args = (chat_ids, args[0]) + args[1:]
                     loop.run_until_complete(notification_func(*new_args, **kwargs))
                 else:
-                    loop.run_until_complete(notification_func(chat_ids, **kwargs))
+                    # Если нет аргументов, добавляем chat_ids и bot_token
+                    loop.run_until_complete(notification_func(chat_ids, TELEGRAM_BOT_TOKEN, **kwargs))
                     
             except Exception as e:
                 logger.error(f"[{self.symbol}] Ошибка в fallback потоке: {e}")
