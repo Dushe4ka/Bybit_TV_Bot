@@ -98,6 +98,8 @@ class ShortAveragingStrategyCelery:
         # Флаги состояния
         self.position_opened = False
         self.stop_loss_price = None
+        self.stop_loss_order_id = None  # ID стоп-лосс ордера
+        self.breakeven_order_id = None  # ID безубыток ордера
         
         # Счетчик попыток открытия
         self.open_attempts = 0
@@ -123,7 +125,7 @@ class ShortAveragingStrategyCelery:
         self.last_position_check = 0
         self.position_check_interval = 5.0  # Проверяем существование позиции раз в 5 секунд
         self.last_averaging_check = 0
-        self.averaging_check_interval = 0.5  # Проверяем усреднение раз в 0.5 сек
+        self.averaging_check_interval = 0.1  # Проверяем усреднение раз в 0.1 сек
         
         # ✨ НОВОЕ: Уменьшаем частоту логирования
         self.log_counter = 0
@@ -486,12 +488,34 @@ class ShortAveragingStrategyCelery:
             logger.error(f"[{self.symbol}] Исключение при выставлении ордера: {e}")
             return False
 
+    def check_averaging_by_position_size(self) -> bool:
+        """Альтернативная проверка усреднения через изменение размера позиции"""
+        try:
+            response = self.session.get_positions(category="linear", symbol=self.symbol)
+            if response.get('retCode') == 0:
+                positions = response.get('result', {}).get('list', [])
+                for pos in positions:
+                    size = float(pos.get('size', 0))
+                    if size > 0:
+                        # Если размер позиции увеличился, значит усреднение сработало
+                        if size > self.position_qty:
+                            logger.info(f"[{self.symbol}] ✅ Размер позиции увеличился: {self.position_qty} -> {size}")
+                            return True
+            return False
+        except Exception as e:
+            logger.error(f"[{self.symbol}] Ошибка проверки размера позиции: {e}")
+            return False
+
     def check_averaging_order_filled(self) -> bool:
         """Проверяет, был ли исполнен ордер на усреднение"""
         try:
             if not self.averaging_order_id:
+                logger.debug(f"[{self.symbol}] Нет ID ордера на усреднение")
                 return False
-                
+            
+            logger.debug(f"[{self.symbol}] Проверяем ордер {self.averaging_order_id}")
+            
+            # 1. Проверяем открытые ордера
             response = self.session.get_open_orders(
                 category="linear",
                 symbol=self.symbol,
@@ -500,8 +524,12 @@ class ShortAveragingStrategyCelery:
             
             if response.get('retCode') == 0:
                 orders = response.get('result', {}).get('list', [])
+                logger.debug(f"[{self.symbol}] Открытые ордера: {len(orders)}")
+                
                 if len(orders) == 0:
-                    # Проверяем историю
+                    # Ордера нет в открытых - проверяем историю
+                    logger.debug(f"[{self.symbol}] Ордер не в открытых, проверяем историю...")
+                    
                     history = self.session.get_order_history(
                         category="linear",
                         symbol=self.symbol,
@@ -510,14 +538,133 @@ class ShortAveragingStrategyCelery:
                     
                     if history.get('retCode') == 0:
                         orders_hist = history.get('result', {}).get('list', [])
+                        logger.debug(f"[{self.symbol}] История ордеров: {len(orders_hist)}")
+                        
                         if len(orders_hist) > 0:
-                            order_status = orders_hist[0].get('orderStatus')
-                            if order_status == 'Filled':
+                            order = orders_hist[0]
+                            order_id = order.get('orderId')
+                            order_status = order.get('orderStatus')
+                            order_side = order.get('side')
+                            
+                            logger.debug(f"[{self.symbol}] Ордер: ID={order_id}, Status={order_status}, Side={order_side}")
+                            
+                            # Проверяем, что это именно наш ордер И он исполнен
+                            if (order_id == self.averaging_order_id and 
+                                order_status == 'Filled' and
+                                order_side == 'Sell'):  # Для шорта это Sell
+                                logger.info(f"[{self.symbol}] ✅ Ордер на усреднение исполнен!")
                                 return True
+                            else:
+                                logger.debug(f"[{self.symbol}] Ордер не исполнен: {order_status}")
+                    else:
+                        logger.debug(f"[{self.symbol}] Ошибка получения истории: {history.get('retMsg')}")
+                else:
+                    logger.debug(f"[{self.symbol}] Ордер еще в открытых")
+            else:
+                logger.debug(f"[{self.symbol}] Ошибка получения открытых ордеров: {response.get('retMsg')}")
+            
             return False
             
         except Exception as e:
             logger.error(f"[{self.symbol}] Ошибка проверки ордера: {e}")
+            return False
+
+    async def place_stop_loss_order(self) -> bool:
+        """Выставляет стоп-лосс ордер в Bybit"""
+        try:
+            logger.info(f"[{self.symbol}] 🛡️ Выставляем стоп-лосс ордер...")
+            logger.info(f"[{self.symbol}] 💰 Цена стоп-лосса: {self.stop_loss_price:.6f} (+{self.stop_loss_percent}%)")
+            logger.info(f"[{self.symbol}] 📈 Количество: {self.position_qty}")
+            
+            # Выставляем стоп-лосс ордер (для шорта это Buy Stop)
+            order = self.session.place_order(
+                category="linear",
+                symbol=self.symbol,
+                side="Buy",  # Для шорта стоп-лосс это Buy
+                orderType="Stop",
+                qty=self.position_qty,
+                stopPrice=self.stop_loss_price,
+                triggerBy="LastPrice"  # Срабатывает по последней цене
+            )
+            
+            if order.get('retCode') == 0:
+                self.stop_loss_order_id = order.get('result', {}).get('orderId')
+                logger.info(f"[{self.symbol}] ✅ Стоп-лосс ордер выставлен! ID: {self.stop_loss_order_id}")
+                return True
+            else:
+                error_msg = order.get('retMsg', 'Неизвестная ошибка')
+                logger.error(f"[{self.symbol}] ❌ Ошибка выставления стоп-лосса: {error_msg}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"[{self.symbol}] Исключение при выставлении стоп-лосса: {e}")
+            return False
+
+    async def place_breakeven_order(self, current_price: float, profit_percent: float) -> bool:
+        """Выставляет безубыток ордер в Bybit"""
+        try:
+            # Отменяем предыдущий безубыток ордер
+            if self.breakeven_order_id:
+                await self.cancel_breakeven_order()
+            
+            logger.info(f"[{self.symbol}] 🔒 Выставляем безубыток на {profit_percent:.1f}%...")
+            logger.info(f"[{self.symbol}] 💰 Цена безубытка: {current_price:.6f}")
+            logger.info(f"[{self.symbol}] 📈 Количество: {self.position_qty}")
+            
+            # Выставляем Buy Stop ордер для закрытия шорта
+            order = self.session.place_order(
+                category="linear",
+                symbol=self.symbol,
+                side="Buy",  # Покупка для закрытия шорта
+                orderType="Stop",
+                qty=self.position_qty,
+                stopPrice=current_price,
+                triggerBy="LastPrice"
+            )
+            
+            if order.get('retCode') == 0:
+                self.breakeven_order_id = order.get('result', {}).get('orderId')
+                self.breakeven_price = current_price
+                logger.info(f"[{self.symbol}] ✅ Безубыток ордер выставлен! ID: {self.breakeven_order_id}")
+                return True
+            else:
+                error_msg = order.get('retMsg', 'Неизвестная ошибка')
+                logger.error(f"[{self.symbol}] ❌ Ошибка выставления безубытка: {error_msg}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"[{self.symbol}] Исключение при выставлении безубытка: {e}")
+            return False
+
+    async def cancel_breakeven_order(self) -> bool:
+        """Отменяет безубыток ордер"""
+        try:
+            if not self.breakeven_order_id:
+                return True
+            
+            logger.info(f"[{self.symbol}] 🔄 Отменяем безубыток ордер {self.breakeven_order_id}")
+            
+            response = self.session.cancel_order(
+                category="linear",
+                symbol=self.symbol,
+                orderId=self.breakeven_order_id
+            )
+            
+            if response.get('retCode') == 0:
+                logger.info(f"[{self.symbol}] ✅ Безубыток ордер отменен")
+                self.breakeven_order_id = None
+                return True
+            else:
+                error_msg = response.get('retMsg', 'Неизвестная ошибка')
+                if 'not exists' in error_msg.lower() or 'not found' in error_msg.lower():
+                    logger.info(f"[{self.symbol}] Безубыток ордер уже не существует")
+                    self.breakeven_order_id = None
+                    return True
+                logger.warning(f"[{self.symbol}] Ошибка отмены безубытка: {error_msg}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"[{self.symbol}] Исключение при отмене безубытка: {e}")
             return False
 
     async def apply_averaging(self, current_price: float) -> bool:
@@ -558,6 +705,9 @@ class ShortAveragingStrategyCelery:
             # ✨ ИСПРАВЛЕНИЕ: Устанавливаем стоп-лосс относительно новой средней цены
             self.stop_loss_price = self.averaged_price * (1 + self.stop_loss_percent / 100)
             
+            # ✨ НОВОЕ: Выставляем стоп-лосс ордер в Bybit
+            await self.place_stop_loss_order()
+            
             # ✨ ИСПРАВЛЕНИЕ: Новый тейк-профит от усредненной цены
             self.tp_price = self.averaged_price * (1 - self.initial_tp_percent / 100)
             # ✨ НОВОЕ: 2% фиктивный TP от усредненной цены
@@ -593,12 +743,7 @@ class ShortAveragingStrategyCelery:
         if not self.position_opened:
             return None
         
-        # ✨ КРИТИЧНО: Проверяем существование позиции РЕДКО (это медленный HTTP запрос)
-        if current_time - self.last_position_check > self.position_check_interval:
-            if not self.check_position_exists():
-                logger.warning(f"[{self.symbol}] Позиция закрыта вручную или не существует!")
-                return "STOP"
-            self.last_position_check = current_time
+        # ✨ ПРИМЕЧАНИЕ: Проверка позиции теперь в handle_message для оптимизации
         
         # ✨ ИСПРАВЛЕНИЕ: Определяем базовую цену для расчетов
         # Если усреднение произошло, используем среднюю цену из API
@@ -643,10 +788,26 @@ class ShortAveragingStrategyCelery:
         
         # ✨ ОПТИМИЗАЦИЯ: Проверяем усреднение чаще, но не на каждом тике
         if not self.is_averaged:
+            # Проверяем по времени
             if current_time - self.last_averaging_check > self.averaging_check_interval:
                 if self.check_averaging_order_filled():
                     await self.apply_averaging(current_price)
                 self.last_averaging_check = current_time
+            
+            # ✨ НОВОЕ: Дополнительная проверка по цене - если цена достигла уровня усреднения
+            averaging_price = self.entry_price * (1 + self.averaging_percent / 100)
+            if current_price >= averaging_price:
+                logger.info(f"[{self.symbol}] 🎯 Цена достигла уровня усреднения! {current_price:.6f} >= {averaging_price:.6f}")
+                
+                # Проверяем двумя способами
+                order_filled = self.check_averaging_order_filled()
+                position_increased = self.check_averaging_by_position_size()
+                
+                if order_filled or position_increased:
+                    logger.info(f"[{self.symbol}] ✅ Усреднение подтверждено! Order: {order_filled}, Position: {position_increased}")
+                    await self.apply_averaging(current_price)
+                else:
+                    logger.warning(f"[{self.symbol}] Цена достигла уровня усреднения, но усреднение не подтверждено!")
         
         # ✨ НОВОЕ: Проверяем 2% фиктивный TP после усреднения
         if self.is_averaged and self.fake_tp_price and current_price <= self.fake_tp_price:
@@ -659,16 +820,18 @@ class ShortAveragingStrategyCelery:
                 )
                 # Фиктивный TP не закрывает позицию, только логируем
         
-        # ✅ КРИТИЧНО: Логика тейк-профита - ПРОВЕРЯЕМ КАЖДЫЙ ТИК!
+        # ✅ КРИТИЧНО: Логика тейк-профита с РЕАЛЬНЫМИ ОРДЕРАМИ
         if profit_percent >= self.initial_tp_percent:
             if not self.breakeven_price:
-                # Первый раз достигли TP - ставим БУ на текущий уровень прибыли
-                self.breakeven_price = current_price
-                self.best_profit_percent = profit_percent
+                # Первый раз достигли TP - выставляем БУ ордер на текущий уровень прибыли
                 logger.info(
                     f"[{self.symbol}] 🎯 Достигнут TP {self.initial_tp_percent}%! "
-                    f"Безубыток установлен на: {self.breakeven_price:.6f} ({profit_percent:.1f}%)"
+                    f"Выставляем безубыток на: {current_price:.6f} ({profit_percent:.1f}%)"
                 )
+                
+                # Выставляем реальный безубыток ордер
+                await self.place_breakeven_order(current_price, profit_percent)
+                self.best_profit_percent = profit_percent
                 
                 # Уведомление асинхронно
                 await self.safe_send_notification(
@@ -686,12 +849,14 @@ class ShortAveragingStrategyCelery:
                 # Если прибыль достигла нового уровня (например, 5% или 7%)
                 if target_breakeven_percent > self.best_profit_percent:
                     old_breakeven = self.breakeven_price
-                    self.breakeven_price = current_price
-                    self.best_profit_percent = target_breakeven_percent
                     logger.info(
-                        f"[{self.symbol}] 🔒 Безубыток перемещен: {old_breakeven:.6f} -> "
-                        f"{self.breakeven_price:.6f} ({target_breakeven_percent:.1f}%)"
+                        f"[{self.symbol}] 🔒 Перемещаем безубыток: {old_breakeven:.6f} -> "
+                        f"{current_price:.6f} ({target_breakeven_percent:.1f}%)"
                     )
+                    
+                    # Выставляем новый безубыток ордер (старый отменится автоматически)
+                    await self.place_breakeven_order(current_price, target_breakeven_percent)
+                    self.best_profit_percent = target_breakeven_percent
                     
                     await self.safe_send_notification(
                         notify_breakeven_moved,
@@ -699,7 +864,8 @@ class ShortAveragingStrategyCelery:
                         self.breakeven_price, target_breakeven_percent, profit_percent
                     )
         
-        # ✅ КРИТИЧНО: Проверяем безубыток НА КАЖДОМ ТИКЕ!
+        # ✅ КРИТИЧНО: Проверяем безубыток - теперь это делается через реальные ордера
+        # Но оставляем fallback проверку на случай, если ордер не сработал
         if self.breakeven_price and current_price >= self.breakeven_price:
             logger.info(
                 f"[{self.symbol}] 🏁 Безубыток сработал! "
@@ -747,7 +913,28 @@ class ShortAveragingStrategyCelery:
             if attempt < max_attempts:
                 await asyncio.sleep(0.5)
         
-        return False
+            return False
+
+    async def stop_trading_for_symbol(self) -> bool:
+        """Останавливает торговлю только для конкретной монеты"""
+        try:
+            logger.info(f"[{self.symbol}] 🛑 Останавливаем торговлю для {self.symbol}...")
+            
+            # ✨ ИСПРАВЛЕНИЕ: Используем функцию stop_trading_by_symbol 
+            # которая отменяет ордера и закрывает позицию только для конкретной монеты
+            stop_trading_by_symbol(self.symbol)
+            
+            # Очищаем локальные переменные
+            self.breakeven_order_id = None
+            self.stop_loss_order_id = None
+            self.averaging_order_id = None
+            
+            logger.info(f"[{self.symbol}] ✅ Торговля для {self.symbol} остановлена")
+            return True
+            
+        except Exception as e:
+            logger.error(f"[{self.symbol}] Ошибка остановки торговли: {e}")
+            return False
 
     def stop_websocket(self):
         """Останавливает WebSocket соединение"""
@@ -765,6 +952,9 @@ class ShortAveragingStrategyCelery:
         try:
             logger.info(f"[{self.symbol}] Закрываем позицию...")
             
+            # ✨ ИСПРАВЛЕНИЕ: Используем функцию остановки торговли только для конкретной монеты
+            await self.stop_trading_for_symbol()
+            
             # Получаем текущую цену для расчетов
             response = self.session.get_tickers(
                 category="linear",
@@ -776,11 +966,7 @@ class ShortAveragingStrategyCelery:
                 if len(tickers) > 0:
                     current_price = float(tickers[0].get('lastPrice', 0))
             
-            # ✨ НОВОЕ: Используем надежную функцию stop_trading_by_symbol
-            logger.info(f"[{self.symbol}] Используем stop_trading_by_symbol для надежного закрытия...")
-            stop_trading_by_symbol(self.symbol)
-            
-            logger.info(f"[{self.symbol}] Позиция успешно закрыта через stop_trading_by_symbol!")
+            logger.info(f"[{self.symbol}] Позиция успешно закрыта!")
             
             # ✨ ИСПРАВЛЕНИЕ: Рассчитываем прибыль/убыток относительно правильной базовой цены
             if self.is_averaged and self.averaged_price:
@@ -855,8 +1041,16 @@ class ShortAveragingStrategyCelery:
                     self.stop_websocket()
                 return
             
-            # ✨ Если позиция открыта, делаем БЫСТРЫЕ локальные расчеты
+            # ✨ КРИТИЧНО: Проверяем, что позиция еще открыта
             if self.position_opened:
+                # Проверяем существование позиции периодически
+                if current_time - self.last_position_check > self.position_check_interval:
+                    if not self.check_position_exists():
+                        logger.warning(f"[{self.symbol}] 🚨 Позиция закрыта вручную или не существует!")
+                        self.should_stop = True
+                        self.stop_websocket()
+                        return
+                    self.last_position_check = current_time
                 # ✨ ИСПРАВЛЕНИЕ: Используем правильную базовую цену
                 if self.is_averaged and self.averaged_price:
                     base_price = self.averaged_price
@@ -911,8 +1105,8 @@ class ShortAveragingStrategyCelery:
                 
             elif action == "STOP":
                 logger.warning(f"⚠️ [{self.symbol}] Позиция закрыта вручную!")
-                if not self.is_averaged and self.averaging_order_id:
-                    self.loop.run_until_complete(self.cancel_averaging_order())
+                # Очищаем все ордера для этой монеты
+                self.loop.run_until_complete(self.stop_trading_for_symbol())
                 self.should_stop = True
                 self.stop_websocket()
                 
