@@ -581,7 +581,7 @@ class ShortAveragingStrategyCelery:
                 category="linear",
                 symbol=self.symbol,
                 side="Buy",  # Для шорта стоп-лосс это Buy
-                orderType="Stop",
+                orderType="Stop",  # ✨ ИСПРАВЛЕНИЕ: Stop вместо StopMarket
                 qty=self.position_qty,
                 stopPrice=self.stop_loss_price,
                 triggerBy="LastPrice"  # Срабатывает по последней цене
@@ -607,16 +607,25 @@ class ShortAveragingStrategyCelery:
             if self.breakeven_order_id:
                 await self.cancel_breakeven_order()
             
+            # ✨ ИСПРАВЛЕНИЕ: НЕ отменяем стоп-лосс - позволяем множественные стоп-ордера
+            # Стоп-лосс защищает от больших убытков, безубыток защищает прибыль
+            
             logger.info(f"[{self.symbol}] 🔒 Выставляем безубыток на {profit_percent:.1f}%...")
             logger.info(f"[{self.symbol}] 💰 Цена безубытка: {current_price:.6f}")
             logger.info(f"[{self.symbol}] 📈 Количество: {self.position_qty}")
+            
+            # ✨ НОВОЕ: Показываем статус множественных стоп-ордеров
+            if self.stop_loss_order_id:
+                logger.info(f"[{self.symbol}] 🛡️ Стоп-лосс активен: {self.stop_loss_price:.6f} (ID: {self.stop_loss_order_id})")
+            else:
+                logger.info(f"[{self.symbol}] ⚠️ Стоп-лосс не установлен")
             
             # Выставляем Buy Stop ордер для закрытия шорта
             order = self.session.place_order(
                 category="linear",
                 symbol=self.symbol,
                 side="Buy",  # Покупка для закрытия шорта
-                orderType="Stop",
+                orderType="Stop",  # ✨ ИСПРАВЛЕНИЕ: Stop вместо StopMarket
                 qty=self.position_qty,
                 stopPrice=current_price,
                 triggerBy="LastPrice"
@@ -822,41 +831,73 @@ class ShortAveragingStrategyCelery:
         
         # ✅ КРИТИЧНО: Логика тейк-профита с РЕАЛЬНЫМИ ОРДЕРАМИ
         if profit_percent >= self.initial_tp_percent:
-            if not self.breakeven_price:
-                # Первый раз достигли TP - выставляем БУ ордер на текущий уровень прибыли
+            if not self.breakeven_price and not self.breakeven_order_id:
+                # ✨ ИСПРАВЛЕНИЕ: Рассчитываем правильную цену безубытка для первого TP
+                if self.is_averaged and self.averaged_price:
+                    base_price = self.averaged_price
+                else:
+                    base_price = self.entry_price
+                
+                # Цена безубытка = базовая цена * (1 - profit_percent / 100)
+                breakeven_price = base_price * (1 - profit_percent / 100)
+                
                 logger.info(
                     f"[{self.symbol}] 🎯 Достигнут TP {self.initial_tp_percent}%! "
-                    f"Выставляем безубыток на: {current_price:.6f} ({profit_percent:.1f}%)"
+                    f"Выставляем безубыток на: {breakeven_price:.6f} ({profit_percent:.1f}%)"
                 )
                 
                 # Выставляем реальный безубыток ордер
-                await self.place_breakeven_order(current_price, profit_percent)
+                await self.place_breakeven_order(breakeven_price, profit_percent)
                 self.best_profit_percent = profit_percent
                 
                 # Уведомление асинхронно
                 await self.safe_send_notification(
                     notify_take_profit_reached,
                     TELEGRAM_BOT_TOKEN, self.symbol,
-                    current_price, profit_percent, self.breakeven_price
+                    current_price, profit_percent, breakeven_price  # ✨ ИСПРАВЛЕНИЕ: используем правильную цену безубытка
                 )
             else:
-                # Проверяем шаги безубытка - каждые 2% прибыли
-                # При 3% прибыли: БУ = 3%
+                # ✨ ИСПРАВЛЕНИЕ: Проверяем шаги безубытка - каждые 2% прибыли
+                # При 3% прибыли: БУ = 3% (уже выставлен выше)
                 # При 5% прибыли: БУ = 5% 
                 # При 7% прибыли: БУ = 7%
-                target_breakeven_percent = int(profit_percent / self.breakeven_step) * self.breakeven_step
+                # При 9% прибыли: БУ = 9%
+                # И так далее...
+                breakeven_levels = [5.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0, 19.0, 21.0, 23.0, 25.0]
+                target_breakeven_percent = None
                 
-                # Если прибыль достигла нового уровня (например, 5% или 7%)
-                if target_breakeven_percent > self.best_profit_percent:
+                for level in breakeven_levels:
+                    if profit_percent >= level and self.best_profit_percent < level:
+                        target_breakeven_percent = level
+                        break
+                
+                # Если прибыль достигла нового уровня (5%, 7%, 9%, 11%, 13%, 15%, 17%, 19%, 21%, 23%, 25%)
+                if target_breakeven_percent and self.breakeven_order_id:
                     old_breakeven = self.breakeven_price
+                    
+                    # ✨ ИСПРАВЛЕНИЕ: Рассчитываем правильную цену безубытка
+                    if self.is_averaged and self.averaged_price:
+                        base_price = self.averaged_price
+                    else:
+                        base_price = self.entry_price
+                    
+                    # Цена безубытка = базовая цена * (1 - target_breakeven_percent / 100)
+                    breakeven_price = base_price * (1 - target_breakeven_percent / 100)
+                    
                     logger.info(
                         f"[{self.symbol}] 🔒 Перемещаем безубыток: {old_breakeven:.6f} -> "
-                        f"{current_price:.6f} ({target_breakeven_percent:.1f}%)"
+                        f"{breakeven_price:.6f} ({target_breakeven_percent:.1f}%)"
                     )
                     
                     # Выставляем новый безубыток ордер (старый отменится автоматически)
-                    await self.place_breakeven_order(current_price, target_breakeven_percent)
+                    await self.place_breakeven_order(breakeven_price, target_breakeven_percent)
                     self.best_profit_percent = target_breakeven_percent
+                    
+                    # ✨ НОВОЕ: Показываем статус множественных стоп-ордеров после перемещения
+                    if self.stop_loss_order_id:
+                        logger.info(f"[{self.symbol}] 🛡️ Стоп-лосс остается активным: {self.stop_loss_price:.6f}")
+                    else:
+                        logger.warning(f"[{self.symbol}] ⚠️ Стоп-лосс не установлен после перемещения безубытка")
                     
                     await self.safe_send_notification(
                         notify_breakeven_moved,
